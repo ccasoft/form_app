@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "151897882187",
+    "project_id": "entry-management-5342a",
+    "storage_bucket": "entry-management-5342a.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:151897882187:android:1db44d6fcb03c1b95957ce",
+        "android_client_info": {
+          "package_name": "com.raipur.cfagc"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDd5qQmpImrAF3tj8KZMT2yEo3ca3bnFRs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

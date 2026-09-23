@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+  <!--
+    If you are serving your web app in a path other than the root, change the
+    href value below to reflect the base path you are serving from.
+
+    The path provided below has to start and end with a slash "/" in order for
+    it to work correctly.
+
+    For more details:
+    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
+
+    This is a placeholder for base href that will be replaced by the value of
+    the `--base-href` argument provided to `flutter build`.
+  -->
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="A new Flutter project.">
+
+  <!-- Viewport: width=device-width prevents browser zoom on input focus (iOS/Android) -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="form_app">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>form_app</title>
+  <link rel="manifest" href="manifest.json">
+
+  <style>
+    /* Prevent body scroll bounce that reveals content behind keyboard */
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      margin: 0;
+      padding: 0;
+      background: #000;
+    }
+    /* Flutter canvas fills only the visible viewport */
+    flt-glass-pane, flutter-view, flt-scene-host {
+      height: 100% !important;
+    }
+  </style>
+</head>
+<body>
+  <script src="flutter_bootstrap.js" async></script>
+  <script>
+    window.addEventListener('load', function() {
+      _flutter.loader.load({
+        onEntrypointLoaded: async function(engineInitializer) {
+          const appRunner = await engineInitializer.initializeEngine({
+            renderer: "canvaskit"
+          });
+          await appRunner.runApp();
+
+          // ── Visual Viewport keyboard handler ──────────────────────────────
+          // When the on-screen keyboard opens on mobile browsers, it shrinks
+          // window.visualViewport.height. We resize the Flutter host element
+          // to match so Flutter sees the correct available height and can
+          // scroll the focused field above the keyboard automatically.
+          // Without this, Flutter uses window.innerHeight (which never changes
+          // on many Android browsers) and content gets hidden behind the keyboard.
+          function applyViewportSize() {
+            const vv = window.visualViewport;
+            if (!vv) return;
+            const host = document.querySelector('flt-glass-pane') ||
+                         document.querySelector('flutter-view');
+            if (!host) return;
+
+            const availH = vv.height;
+            const availW = vv.width;
+            const offsetTop = vv.offsetTop;
+            const offsetLeft = vv.offsetLeft;
+
+            host.style.height  = availH + 'px';
+            host.style.width   = availW + 'px';
+            host.style.top     = offsetTop  + 'px';
+            host.style.left    = offsetLeft + 'px';
+            host.style.position = 'fixed';
+          }
+
+          if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', applyViewportSize);
+            window.visualViewport.addEventListener('scroll', applyViewportSize);
+            applyViewportSize();
+          }
+          // ─────────────────────────────────────────────────────────────────
+        }
+      });
+    });
+  </script>
+</body>
+</html>
