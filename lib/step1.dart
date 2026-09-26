@@ -239,7 +239,8 @@ class _Step1State extends State<Step1> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => guardScreenView(ScreenKeys.step1, label: 'Invoice Preparation'));
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => guardScreenView(ScreenKeys.step1, label: 'Invoice Preparation'));
     _fetchData();
     _invoiceDateCtrl.text = DateFormat('dd-MM-yyyy').format(DateTime.now());
     _validityDateCtrl.text = DateFormat('dd-MM-yyyy')
@@ -271,6 +272,44 @@ class _Step1State extends State<Step1> {
         _transportList = t.map((s) => s.trim()).toList();
         isLoading = false;
       });
+  }
+
+  // Bounded, capped-height options list for Autocomplete fields — without
+  // this, the default overlay grows to fit every match and can visually
+  // cover the cards further down the form while the user is still typing.
+  Widget _boundedOptionsView<T extends Object>({
+    required List<T> options,
+    required void Function(T) onSelected,
+    required String Function(T) labelOf,
+  }) {
+    return Align(
+      alignment: Alignment.topLeft,
+      child: Material(
+        elevation: 4,
+        borderRadius: BorderRadius.circular(8),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 220),
+          child: ListView.builder(
+            padding: EdgeInsets.zero,
+            shrinkWrap: true,
+            itemCount: options.length,
+            itemBuilder: (ctx, i) {
+              final o = options[i];
+              return InkWell(
+                onTap: () => onSelected(o),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  child: Text(labelOf(o),
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w600, fontSize: 13)),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _pickDate(TextEditingController ctrl) async {
@@ -485,6 +524,12 @@ class _Step1State extends State<Step1> {
                                       : companies.where((c) => c.companyName
                                           .toLowerCase()
                                           .contains(tv.text.toLowerCase())),
+                                  optionsViewBuilder:
+                                      (ctx, onSelected, options) =>
+                                          _boundedOptionsView<CompanyData>(
+                                              options: options.toList(),
+                                              onSelected: onSelected,
+                                              labelOf: (o) => o.companyName),
                                   displayStringForOption: (o) => o.companyName,
                                   fieldViewBuilder: (ctx, tc, fn, _) =>
                                       TextFormField(
@@ -531,6 +576,12 @@ class _Step1State extends State<Step1> {
                                             .toLowerCase()
                                             .contains(tv.text.toLowerCase()));
                                   },
+                                  optionsViewBuilder:
+                                      (ctx, onSelected, options) =>
+                                          _boundedOptionsView<PartyData>(
+                                              options: options.toList(),
+                                              onSelected: onSelected,
+                                              labelOf: (o) => o.partyName),
                                   displayStringForOption: (o) => o.partyName,
                                   fieldViewBuilder: (ctx, tc, fn, _) =>
                                       TextFormField(
@@ -817,49 +868,65 @@ class _Step1State extends State<Step1> {
                               Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    TextFormField(
-                                      controller: _invoiceNumberCtrl,
-                                      onChanged: _validateInvoiceNumber,
-                                      decoration: InputDecoration(
-                                        labelText: 'Invoice No. *',
-                                        hintText: _seriesConfig != null
-                                            ? _seriesConfig!.prefix.isNotEmpty
-                                                ? '${_seriesConfig!.prefix}${_seriesConfig!.startNumber}'
-                                                : 'e.g. ${_seriesConfig!.startNumber}'
-                                            : null,
-                                        hintStyle: const TextStyle(
-                                            fontSize: 11, color: Colors.grey),
-                                        prefixIcon: const Icon(
-                                            Icons.tag_rounded,
-                                            size: 18),
-                                        contentPadding:
-                                            const EdgeInsets.symmetric(
-                                                horizontal: 12, vertical: 12),
-                                        suffixIcon: _loadingSeries
-                                            ? const Padding(
-                                                padding: EdgeInsets.all(12),
-                                                child: SizedBox(
-                                                    width: 14,
-                                                    height: 14,
-                                                    child:
-                                                        CircularProgressIndicator(
-                                                            strokeWidth: 2)))
-                                            : _seriesConfig != null
-                                                ? Icon(Icons.verified_rounded,
-                                                    color: _seriesError != null
-                                                        ? AppTheme.danger
-                                                        : AppTheme.success,
-                                                    size: 18)
-                                                : null,
+                                    GestureDetector(
+                                      onDoubleTap: _seriesConfig != null
+                                          ? _openMissingInvoicePicker
+                                          : null,
+                                      child: TextFormField(
+                                        controller: _invoiceNumberCtrl,
+                                        onChanged: _validateInvoiceNumber,
+                                        decoration: InputDecoration(
+                                          labelText: 'Invoice No. *',
+                                          hintText: _seriesConfig != null
+                                              ? _seriesConfig!.prefix.isNotEmpty
+                                                  ? '${_seriesConfig!.prefix}${_seriesConfig!.startNumber}'
+                                                  : 'e.g. ${_seriesConfig!.startNumber}'
+                                              : null,
+                                          hintStyle: const TextStyle(
+                                              fontSize: 11, color: Colors.grey),
+                                          prefixIcon: const Icon(
+                                              Icons.tag_rounded,
+                                              size: 18),
+                                          contentPadding:
+                                              const EdgeInsets.symmetric(
+                                                  horizontal: 12, vertical: 12),
+                                          suffixIcon: _loadingSeries
+                                              ? const Padding(
+                                                  padding: EdgeInsets.all(12),
+                                                  child: SizedBox(
+                                                      width: 14,
+                                                      height: 14,
+                                                      child:
+                                                          CircularProgressIndicator(
+                                                              strokeWidth: 2)))
+                                              : _seriesConfig != null
+                                                  ? Icon(Icons.verified_rounded,
+                                                      color: _seriesError !=
+                                                              null
+                                                          ? AppTheme.danger
+                                                          : AppTheme.success,
+                                                      size: 18)
+                                                  : null,
+                                        ),
+                                        validator: (v) {
+                                          if (v == null || v.isEmpty)
+                                            return 'Required';
+                                          if (_seriesError != null)
+                                            return _seriesError;
+                                          return null;
+                                        },
                                       ),
-                                      validator: (v) {
-                                        if (v == null || v.isEmpty)
-                                          return 'Required';
-                                        if (_seriesError != null)
-                                          return _seriesError;
-                                        return null;
-                                      },
                                     ),
+                                    if (_seriesConfig != null)
+                                      const Padding(
+                                        padding:
+                                            EdgeInsets.only(top: 4, left: 4),
+                                        child: Text(
+                                            'Double-tap to pick from unused invoice numbers',
+                                            style: TextStyle(
+                                                fontSize: 10,
+                                                color: AppTheme.textSecondary)),
+                                      ),
                                     if (_seriesError != null)
                                       Padding(
                                         padding: const EdgeInsets.only(
@@ -968,7 +1035,11 @@ class _Step1State extends State<Step1> {
                                     const EdgeInsets.symmetric(vertical: 14),
                                 shape: RoundedRectangleBorder(
                                     borderRadius: BorderRadius.circular(12))),
-                            onPressed: (isSaving || !AuthService.to.perms.canAdd(ScreenKeys.step1)) ? null : _submit,
+                            onPressed: (isSaving ||
+                                    !AuthService.to.perms
+                                        .canAdd(ScreenKeys.step1))
+                                ? null
+                                : _submit,
                             icon: isSaving
                                 ? const SizedBox(
                                     width: 18,
@@ -1167,6 +1238,155 @@ class _Step1State extends State<Step1> {
         if (_invoiceNumberCtrl.text.isNotEmpty)
           _validateInvoiceNumber(_invoiceNumberCtrl.text);
       });
+    }
+  }
+
+  // Double-tap on the Invoice No. field — lists up to 50 not-yet-entered
+  // numbers in the selected series so the user can pick one instead of
+  // typing it (fewer keystrokes, no typo'd/duplicate invoice numbers).
+  Future<void> _openMissingInvoicePicker() async {
+    final cfg = _seriesConfig;
+    final company = selectedCompany;
+    if (cfg == null || company == null) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+
+    // Total numbers to offer in the picker, missing + next-in-sequence
+    // combined — not each category capped independently.
+    const pickerTotalCap = 50;
+
+    final fy = InvoiceSeriesConfig.financialYearOf(DateTime.now());
+    Map<String, dynamic>? res;
+    try {
+      res = await ApiService().getMissingInvoiceNumbers(
+          company.companyId, fy, cfg.prefix,
+          startNumber: cfg.startNumber,
+          cap: pickerTotalCap,
+          nextCap: pickerTotalCap);
+    } catch (e) {
+      res = null;
+    }
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pop(); // close loading dialog
+    if (!mounted) return;
+
+    if (res == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content:
+              Text('Could not check for missing invoice numbers. Try again.')));
+      return;
+    }
+
+    final missingAll = List<int>.from(res['missing'] as List? ?? []);
+    // Numbers past the latest entered one, never allocated to any party —
+    // distinct from `missing`, which are gaps skipped inside the used range.
+    final unallocatedAll = List<int>.from(res['unallocated'] as List? ?? []);
+
+    // Combined total shown is capped at pickerTotalCap — missing numbers
+    // fill the budget first, next-in-sequence numbers fill the rest.
+    final missing = missingAll.take(pickerTotalCap).toList();
+    final unallocated =
+        unallocatedAll.take(pickerTotalCap - missing.length).toList();
+
+    if (missing.isEmpty && unallocated.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'No missing or unused invoice numbers found in this series.')));
+      return;
+    }
+
+    final totalFound = missing.length + unallocated.length;
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.55,
+        minChildSize: 0.3,
+        maxChildSize: 0.85,
+        builder: (_, ctrl) => Container(
+          decoration: const BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+          child: Column(children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 14, 18, 6),
+              child: Row(children: [
+                const Expanded(
+                    child: Text('Unused invoice numbers',
+                        style: TextStyle(
+                            fontSize: 15, fontWeight: FontWeight.w800))),
+                Text('$totalFound found',
+                    style: const TextStyle(
+                        fontSize: 11, color: AppTheme.textSecondary)),
+              ]),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView(
+                controller: ctrl,
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                children: [
+                  if (missing.isNotEmpty) ...[
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 10, 18, 4),
+                      child: Text(
+                          'MISSING — SKIPPED IN SEQUENCE (${missing.length})',
+                          style: const TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 0.3,
+                              color: AppTheme.textSecondary)),
+                    ),
+                    ...missing.map((n) => ListTile(
+                          dense: true,
+                          leading: const Icon(Icons.tag_rounded,
+                              color: AppTheme.primary),
+                          title: Text(cfg.formatNumber(n),
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w700, fontSize: 13)),
+                          onTap: () => Navigator.pop(context, n),
+                        )),
+                  ],
+                  if (unallocated.isNotEmpty) ...[
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 14, 18, 4),
+                      child: Text(
+                          'NOT YET USED — NEXT IN SEQUENCE (${unallocated.length})',
+                          style: const TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 0.3,
+                              color: AppTheme.textSecondary)),
+                    ),
+                    ...unallocated.map((n) => ListTile(
+                          dense: true,
+                          leading: const Icon(Icons.fiber_new_rounded,
+                              color: AppTheme.stageDispatch),
+                          title: Text(cfg.formatNumber(n),
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w700, fontSize: 13)),
+                          onTap: () => Navigator.pop(context, n),
+                        )),
+                  ],
+                ],
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+
+    if (picked != null) {
+      final formatted = cfg.formatNumber(picked);
+      _invoiceNumberCtrl.text = formatted;
+      _invoiceNumberCtrl.selection =
+          TextSelection.fromPosition(TextPosition(offset: formatted.length));
+      _validateInvoiceNumber(formatted);
     }
   }
 

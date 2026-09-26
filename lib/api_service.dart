@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show debugPrint;
@@ -8,7 +9,9 @@ import 'package:form_app/invoice_series_config.dart';
 
 const String _BASE_URL =
     //'https://unabsorbed-noncongregative-truman.ngrok-free.dev';
-    'https://win-dkfo938f104-1.tail25c88f.ts.net';
+    //'https://win-dkfo938f104-1.tail25c88f.ts.net';
+    'https://api.idaagrico.com';
+//'https://chowder-clubbed-amiable.ngrok-free.dev';
 
 const Map<String, String> _HEADERS = {
   'Content-Type': 'application/json',
@@ -18,15 +21,29 @@ const Map<String, String> _GET_HEADERS = {
   'ngrok-skip-browser-warning': 'true',
 };
 
+// Every request gets a hard ceiling. Without this, a slow/degraded
+// Tailscale link (relayed through DERP instead of a direct peer link) or
+// a sleeping host machine makes a call hang indefinitely — the screen just
+// spins forever instead of failing fast so the user can retry. 15s is
+// generous for a LAN/Tailscale link but still much better than "forever".
+const Duration _kTimeout = Duration(seconds: 15);
+
 class ApiService {
   // Public baseUrl so other files can use ApiService.baseUrl
   static String get baseUrl => _BASE_URL;
 
   static Future<Map<String, dynamic>> _get(String path) async {
     try {
-      final r =
-          await http.get(Uri.parse('$_BASE_URL$path'), headers: _GET_HEADERS);
+      final r = await http
+          .get(Uri.parse('$_BASE_URL$path'), headers: _GET_HEADERS)
+          .timeout(_kTimeout);
       return jsonDecode(r.body) as Map<String, dynamic>;
+    } on TimeoutException {
+      debugPrint('GET $path timed out');
+      return {
+        'success': false,
+        'error': 'Request timed out — check your connection to the server.'
+      };
     } catch (e) {
       debugPrint('GET $path error: $e');
       return {'success': false, 'error': '$e'};
@@ -36,9 +53,17 @@ class ApiService {
   static Future<Map<String, dynamic>> _post(
       String path, Map<String, dynamic> body) async {
     try {
-      final r = await http.post(Uri.parse('$_BASE_URL$path'),
-          headers: _HEADERS, body: jsonEncode(body));
+      final r = await http
+          .post(Uri.parse('$_BASE_URL$path'),
+              headers: _HEADERS, body: jsonEncode(body))
+          .timeout(_kTimeout);
       return jsonDecode(r.body) as Map<String, dynamic>;
+    } on TimeoutException {
+      debugPrint('POST $path timed out');
+      return {
+        'success': false,
+        'error': 'Request timed out — check your connection to the server.'
+      };
     } catch (e) {
       debugPrint('POST $path error: $e');
       return {'success': false, 'error': '$e'};
@@ -48,9 +73,17 @@ class ApiService {
   static Future<Map<String, dynamic>> _put(
       String path, Map<String, dynamic> body) async {
     try {
-      final r = await http.put(Uri.parse('$_BASE_URL$path'),
-          headers: _HEADERS, body: jsonEncode(body));
+      final r = await http
+          .put(Uri.parse('$_BASE_URL$path'),
+              headers: _HEADERS, body: jsonEncode(body))
+          .timeout(_kTimeout);
       return jsonDecode(r.body) as Map<String, dynamic>;
+    } on TimeoutException {
+      debugPrint('PUT $path timed out');
+      return {
+        'success': false,
+        'error': 'Request timed out — check your connection to the server.'
+      };
     } catch (e) {
       debugPrint('PUT $path error: $e');
       return {'success': false, 'error': '$e'};
@@ -59,9 +92,16 @@ class ApiService {
 
   static Future<Map<String, dynamic>> _delete(String path) async {
     try {
-      final r = await http.delete(Uri.parse('$_BASE_URL$path'),
-          headers: _GET_HEADERS);
+      final r = await http
+          .delete(Uri.parse('$_BASE_URL$path'), headers: _GET_HEADERS)
+          .timeout(_kTimeout);
       return jsonDecode(r.body) as Map<String, dynamic>;
+    } on TimeoutException {
+      debugPrint('DELETE $path timed out');
+      return {
+        'success': false,
+        'error': 'Request timed out — check your connection to the server.'
+      };
     } catch (e) {
       debugPrint('DELETE $path error: $e');
       return {'success': false, 'error': '$e'};
@@ -283,14 +323,23 @@ class ApiService {
   // Server-side gap detection — fast, no Flutter loop needed.
   Future<Map<String, dynamic>> getMissingInvoiceNumbers(
       String companyId, int fy, String prefix,
-      {int startNumber = 1, int? upperBound, int cap = 500}) async {
+      {int startNumber = 1,
+      int? upperBound,
+      int cap = 500,
+      int nextCap = 20}) async {
     final enc = Uri.encodeComponent(prefix.isEmpty ? '_NONE_' : prefix);
     String q =
-        '/invoices/missing-numbers/$companyId/$fy/$enc?start=$startNumber&cap=$cap';
+        '/invoices/missing-numbers/$companyId/$fy/$enc?start=$startNumber&cap=$cap&nextCap=$nextCap';
     if (upperBound != null) q += '&upper=$upperBound';
     final r = await _get(q);
     if (!_ok(r))
-      return {'missing': <int>[], 'total': 0, 'entered': 0, 'maxNum': 0};
+      return {
+        'missing': <int>[],
+        'total': 0,
+        'entered': 0,
+        'maxNum': 0,
+        'unallocated': <int>[],
+      };
     final d = r['data'] as Map<String, dynamic>;
     return {
       'missing':
@@ -299,6 +348,10 @@ class ApiService {
       'entered': (d['entered'] as num).toInt(),
       'maxNum': (d['maxNum'] as num).toInt(),
       'minNum': (d['minNum'] as num?)?.toInt(),
+      // Next numbers in sequence past maxNum, never allocated to any party —
+      // distinct from 'missing', which are gaps inside the already-used range.
+      'unallocated': List<int>.from(
+          (d['unallocated'] as List? ?? []).map((n) => (n as num).toInt())),
       'warning': d['warning'] as String?,
     };
   }
@@ -398,22 +451,39 @@ class ApiService {
   // contacts) by matching an entry's name/firmName against [name].
   // Used so telecalling can call the numbers already saved in Office
   // Hub rather than duplicating contact data on the invoice itself.
+  // Fetches every category's entries for [prefix] IN PARALLEL (one round
+  // trip per category, all in flight together) instead of one at a time —
+  // used by both lookups below. With N categories this turns N sequential
+  // network round trips into effectively one, which is what made opening
+  // the telecalling call screen feel slow before.
+  Future<List<Map<String, dynamic>>> _allOfficeEntries(String prefix) async {
+    final categories = await getOfficeCategories(prefix);
+    final catNames = categories
+        .map((c) => c['name']?.toString() ?? '')
+        .where((n) => n.isNotEmpty)
+        .toList();
+    final entryLists = await Future.wait(
+        catNames.map((catName) => getOfficeCategoryEntries(prefix, catName)));
+    final all = <Map<String, dynamic>>[];
+    for (var i = 0; i < catNames.length; i++) {
+      for (final e in entryLists[i]) {
+        all.add({...e, '_categoryName': catNames[i]});
+      }
+    }
+    return all;
+  }
+
   Future<String?> findOfficeContactPhone(String prefix, String name) async {
     final target = name.trim().toLowerCase();
     if (target.isEmpty) return null;
     try {
-      final categories = await getOfficeCategories(prefix);
-      for (final cat in categories) {
-        final catName = cat['name']?.toString() ?? '';
-        if (catName.isEmpty) continue;
-        final entries = await getOfficeCategoryEntries(prefix, catName);
-        for (final e in entries) {
-          final n = (e['name']?.toString() ?? '').trim().toLowerCase();
-          final firm = (e['firmName']?.toString() ?? '').trim().toLowerCase();
-          if (n == target || firm == target) {
-            final phone = e['phone']?.toString();
-            if (phone != null && phone.isNotEmpty) return phone;
-          }
+      final entries = await _allOfficeEntries(prefix);
+      for (final e in entries) {
+        final n = (e['name']?.toString() ?? '').trim().toLowerCase();
+        final firm = (e['firmName']?.toString() ?? '').trim().toLowerCase();
+        if (n == target || firm == target) {
+          final phone = e['phone']?.toString();
+          if (phone != null && phone.isNotEmpty) return phone;
         }
       }
     } catch (e) {
@@ -433,25 +503,20 @@ class ApiService {
     if (target.isEmpty) return [];
     final matches = <Map<String, dynamic>>[];
     try {
-      final categories = await getOfficeCategories(prefix);
-      for (final cat in categories) {
-        final catName = cat['name']?.toString() ?? '';
-        if (catName.isEmpty) continue;
-        final entries = await getOfficeCategoryEntries(prefix, catName);
-        for (final e in entries) {
-          final n = (e['name']?.toString() ?? '').trim().toLowerCase();
-          final firm = (e['firmName']?.toString() ?? '').trim().toLowerCase();
-          if (n == target || firm == target) {
-            final phone = e['phone']?.toString() ?? '';
-            if (phone.isNotEmpty) {
-              matches.add({
-                'id': e['id'],
-                'categoryName': catName,
-                'name': e['name'],
-                'phone': phone,
-                'notes': e['notes']?.toString() ?? '',
-              });
-            }
+      final entries = await _allOfficeEntries(prefix);
+      for (final e in entries) {
+        final n = (e['name']?.toString() ?? '').trim().toLowerCase();
+        final firm = (e['firmName']?.toString() ?? '').trim().toLowerCase();
+        if (n == target || firm == target) {
+          final phone = e['phone']?.toString() ?? '';
+          if (phone.isNotEmpty) {
+            matches.add({
+              'id': e['id'],
+              'categoryName': e['_categoryName'],
+              'name': e['name'],
+              'phone': phone,
+              'notes': e['notes']?.toString() ?? '',
+            });
           }
         }
       }
@@ -482,6 +547,17 @@ class ApiService {
     };
     return _ok(
         await _post('/invoices/batch-update', {'ids': ids, 'data': body}));
+  }
+
+  // Split dispatch — posts straight to /invoices/dispatch-split with a FLAT
+  // body (ids, caseCounts, caseTotals, tripNumber, vehicleNumber, ... all
+  // top-level), unlike createDispatch's {ids, data} wrapper around
+  // /invoices/batch-update. The server records one trip's cases per
+  // invoice and only finalizes an invoice to stage 3 once its cases are
+  // fully accounted for; an id with no caseCounts/caseTotals entry just
+  // finalizes immediately, same as a normal createDispatch call.
+  Future<bool> createPartialDispatch(Map<String, dynamic> data) async {
+    return _ok(await _post('/invoices/dispatch-split', data));
   }
 
   Future<bool> deleteDispatch(List<String> invoiceIds) async {
@@ -646,15 +722,32 @@ class ApiService {
         await _post('/invoices/batch-update', {'ids': allIds, 'data': body}));
   }
 
+  // onError (optional, default no-op — existing callers are unaffected) lets
+  // a screen surface the real failure reason (a timeout, a backend SQL
+  // error, etc.) instead of silently getting an empty list back, which is
+  // indistinguishable from "genuinely no data".
+  //
+  // since (optional): caps the query to invoices created on/after this
+  // moment (sent as sinceTimestamp). Omitted = old unfiltered "whole
+  // history" behavior. Screens that used to always fetch everything
+  // (Dispatch Dashboard, Pulse) now default to a recent window and only
+  // drop this when the user explicitly asks for "All Time" — on a large
+  // table the unfiltered query is the one most likely to time out (or,
+  // over some connections such as a Tailscale Funnel, fail on the larger
+  // response body), so keeping the default request small avoids that.
   Future<List<InvoiceAcknowledgementData>> getAllMasterInvoices(
-      {int? year, int? month}) async {
+      {int? year, int? month, DateTime? since, void Function(String)? onError}) async {
     String q = '/invoices/master';
     final params = <String>[];
     if (year != null) params.add('year=$year');
     if (month != null) params.add('month=$month');
+    if (since != null) params.add('sinceTimestamp=${since.millisecondsSinceEpoch}');
     if (params.isNotEmpty) q += '?${params.join('&')}';
     final r = await _get(q);
-    if (!_ok(r)) return [];
+    if (!_ok(r)) {
+      onError?.call(r['error']?.toString() ?? 'Unknown error loading invoices');
+      return [];
+    }
     return (r['data'] as List)
         .map((d) => _mapToInvoiceAck(d as Map<String, dynamic>))
         .toList();
@@ -723,18 +816,21 @@ class ApiService {
   }) async {
     try {
       final base64Image = base64Encode(imageBytes);
-      final r = await http.post(
-        Uri.parse('$_BASE_URL/upload/ack-photo-base64'),
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
-        },
-        body: jsonEncode({
-          'imageBase64': base64Image,
-          'invoiceIds': invoiceIds,
-          'invoiceNumbers': invoiceNumbers,
-        }),
-      );
+      final r = await http
+          .post(
+            Uri.parse('$_BASE_URL/upload/ack-photo-base64'),
+            headers: {
+              'Content-Type': 'application/json',
+              'ngrok-skip-browser-warning': 'true',
+            },
+            body: jsonEncode({
+              'imageBase64': base64Image,
+              'invoiceIds': invoiceIds,
+              'invoiceNumbers': invoiceNumbers,
+            }),
+          )
+          .timeout(const Duration(
+              seconds: 45)); // uploads need more room than _kTimeout
       debugPrint('uploadAckPhotoBytes status: ${r.statusCode}');
       debugPrint('uploadAckPhotoBytes body: ${r.body}');
       final body = jsonDecode(r.body);
@@ -754,7 +850,7 @@ class ApiService {
       req.files.add(http.MultipartFile.fromBytes('file', imageBytes,
           filename: fileName, contentType: MediaType('image', 'jpeg')));
       req.fields['invoiceIds'] = jsonEncode(invoiceId);
-      final res = await req.send();
+      final res = await req.send().timeout(const Duration(seconds: 45));
       final body = jsonDecode(await res.stream.bytesToString());
       return body['success'] == true;
     } catch (e) {
@@ -797,6 +893,7 @@ class ApiService {
       dispatchDate: d['dispatchDate'],
       tripNumber: d['tripNumber'],
       openingKm: d['openingKm'],
+      bhada: d['bhada'],
       lrNumber: d['lrNumber'],
       lrDate: d['lrDate'],
       packCase: d['packCase'],

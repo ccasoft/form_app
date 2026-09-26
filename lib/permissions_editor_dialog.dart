@@ -56,13 +56,33 @@ class _PermissionsEditorDialogState extends State<PermissionsEditorDialog> {
 
   Future<void> _save() async {
     setState(() => _saving = true);
-    final ok = await _api.savePermissions(
-      widget.userId,
-      {for (final e in _screens.entries) e.key: e.value.toJson()},
-    );
+    final sent = {for (final e in _screens.entries) e.key: e.value.toJson()};
+    final ok = await _api.savePermissions(widget.userId, sent);
+
+    // The server can answer {success: true} without actually persisting
+    // every field (e.g. it silently drops a key it doesn't recognise),
+    // which is exactly what looks like "saved, no error, but nothing
+    // changed" from the user's side. Re-read what the server now has
+    // and compare it against what we just sent, instead of trusting its
+    // success flag alone — a save is only real if it reads back the same.
+    bool verified = false;
+    List<String> mismatched = const [];
+    if (ok) {
+      final readBack = await _api.fetchPermissions(widget.userId);
+      if (readBack != null) {
+        final saved = UserPermissions.fromJson(readBack).screens;
+        mismatched = [
+          for (final key in _screens.keys)
+            if (saved[key]?.toJson().toString() != sent[key].toString()) key
+        ];
+        verified = mismatched.isEmpty;
+      }
+    }
+
     if (!mounted) return;
     setState(() => _saving = false);
-    if (ok) {
+
+    if (ok && verified) {
       if (AuthService.to.currentUser?.userId == widget.userId) {
         await AuthService.to.refreshPermissions();
       }
@@ -71,6 +91,21 @@ class _PermissionsEditorDialogState extends State<PermissionsEditorDialog> {
           backgroundColor: Colors.green.shade50,
           colorText: Colors.green.shade800,
           snackPosition: SnackPosition.BOTTOM);
+    } else if (ok && !verified) {
+      // Server said success but the read-back doesn't match — surface
+      // this as a real error instead of a false "Saved".
+      Get.snackbar(
+        'Not Actually Saved',
+        'The server accepted the request but didn\'t persist ${mismatched.length} '
+            'permission${mismatched.length == 1 ? '' : 's'} '
+            '(${mismatched.join(', ')}). This is a backend issue, not something '
+            'fixable from the app — the server may be rejecting or dropping '
+            'newer screen keys.',
+        backgroundColor: Colors.orange.shade50,
+        colorText: Colors.orange.shade900,
+        snackPosition: SnackPosition.BOTTOM,
+        duration: const Duration(seconds: 8),
+      );
     } else {
       Get.snackbar('Error', 'Could not save permissions. Try again.',
           backgroundColor: Colors.red.shade50,
@@ -87,8 +122,7 @@ class _PermissionsEditorDialogState extends State<PermissionsEditorDialog> {
         constraints: const BoxConstraints(maxWidth: 560, maxHeight: 680),
         child: _loading
             ? const SizedBox(
-                height: 300,
-                child: Center(child: CircularProgressIndicator()))
+                height: 300, child: Center(child: CircularProgressIndicator()))
             : Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -99,7 +133,8 @@ class _PermissionsEditorDialogState extends State<PermissionsEditorDialog> {
                       padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
-                        children: kScreenKeys.map((key) => _screenRow(key)).toList(),
+                        children:
+                            kScreenKeys.map((key) => _screenRow(key)).toList(),
                       ),
                     ),
                   ),
@@ -113,7 +148,8 @@ class _PermissionsEditorDialogState extends State<PermissionsEditorDialog> {
   Widget _header() => Padding(
         padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
         child: Row(children: [
-          const Icon(Icons.security_rounded, size: 20, color: Color(0xFF334155)),
+          const Icon(Icons.security_rounded,
+              size: 20, color: Color(0xFF334155)),
           const SizedBox(width: 8),
           Expanded(
             child: Text('Permissions — ${widget.userName}',

@@ -38,49 +38,61 @@ class OfficeHubScreen extends StatelessWidget {
     final perms = AuthService.to.perms;
     final isAdmin = perms.isAdmin;
 
+    // Every tile is always shown to every logged-in user now — access is
+    // checked at tap time (see _MenuTileWidget) instead of hiding tiles
+    // the user isn't permitted to see. That way a locked tile is still
+    // visible (so people know the module exists and who to ask), but
+    // tapping it shows a clear "no permission" message instead of
+    // opening the screen.
     final tiles = <_MenuTile>[
-      if (perms.canView(ScreenKeys.officeTransportContacts))
-        _MenuTile(
-          title: 'Transport Contact',
-          icon: Icons.local_shipping_rounded,
-          color: const Color(0xFF1E88E5),
-          onTap: () => Get.to(() => const TransportContactsModule()),
-        ),
-      if (perms.canView(ScreenKeys.officeAddressBook))
-        _MenuTile(
-          title: 'Address Book',
-          icon: Icons.contact_phone_rounded,
-          color: const Color(0xFF2E7D32),
-          onTap: () => Get.to(() => const AddressBookModule()),
-        ),
-      if (perms.canView(ScreenKeys.officeRegisters)) ...[
-        _MenuTile(
-          title: 'General Register',
-          icon: Icons.menu_book_rounded,
-          color: const Color(0xFF7B1FA2),
-          onTap: () => Get.to(() => const RegisterModule()),
-        ),
-        _MenuTile(
-          title: 'LR Register',
-          icon: Icons.receipt_long_rounded,
-          color: const Color(0xFF6D4C41),
-          onTap: () => Get.to(() => const RegisterModule()),
-        ),
-      ],
-      if (perms.canView(ScreenKeys.officeReminderMail))
-        _MenuTile(
-          title: 'Mail Reminders',
-          icon: Icons.mail_rounded,
-          color: const Color(0xFF3949AB),
-          onTap: () => Get.to(() => const ReminderMailModule()),
-        ),
-      if (perms.canView(ScreenKeys.officePasswords))
-        _MenuTile(
-          title: 'Passwords',
-          icon: Icons.vpn_key_rounded,
-          color: const Color(0xFFD32F2F),
-          onTap: () => Get.to(() => const PasswordModule()),
-        ),
+      _MenuTile(
+        title: 'Transport Contact',
+        icon: Icons.local_shipping_rounded,
+        color: const Color(0xFF1E88E5),
+        locked: !perms.canView(ScreenKeys.officeTransportContacts),
+        onTap: () => Get.to(() => const TransportContactsModule()),
+        anim: _IconAnim.pulse,
+      ),
+      _MenuTile(
+        title: 'Address Book',
+        icon: Icons.contact_phone_rounded,
+        color: const Color(0xFF2E7D32),
+        locked: !perms.canView(ScreenKeys.officeAddressBook),
+        onTap: () => Get.to(() => const AddressBookModule()),
+        anim: _IconAnim.wiggle,
+      ),
+      _MenuTile(
+        title: 'General Register',
+        icon: Icons.menu_book_rounded,
+        color: const Color(0xFF7B1FA2),
+        locked: !perms.canView(ScreenKeys.officeRegisters),
+        onTap: () => Get.to(() => const RegisterModule()),
+        anim: _IconAnim.float,
+      ),
+      _MenuTile(
+        title: 'LR Register',
+        icon: Icons.receipt_long_rounded,
+        color: const Color(0xFF6D4C41),
+        locked: !perms.canView(ScreenKeys.officeRegisters),
+        onTap: () => Get.to(() => const RegisterModule()),
+        anim: _IconAnim.float,
+      ),
+      _MenuTile(
+        title: 'Mail Reminders',
+        icon: Icons.mail_rounded,
+        color: const Color(0xFF3949AB),
+        locked: !perms.canView(ScreenKeys.officeReminderMail),
+        onTap: () => Get.to(() => const ReminderMailModule()),
+        anim: _IconAnim.bounce,
+      ),
+      _MenuTile(
+        title: 'Passwords',
+        icon: Icons.vpn_key_rounded,
+        color: const Color(0xFFD32F2F),
+        locked: !perms.canView(ScreenKeys.officePasswords),
+        onTap: () => Get.to(() => const PasswordModule()),
+        anim: _IconAnim.glow,
+      ),
       // OTP Approvals has no dedicated screen-key: the screen itself
       // branches by isAdmin (full queue) vs. staff (own request
       // history only), so it stays open to every logged-in user.
@@ -88,17 +100,20 @@ class OfficeHubScreen extends StatelessWidget {
         title: 'OTP Approvals',
         icon: Icons.shield_rounded,
         color: const Color(0xFFEF6C00),
+        locked: false,
         onTap: () => Get.to(() => const OtpApprovalsScreen()),
+        anim: _IconAnim.spin,
       ),
       // Admin Console (manage users, audit log, license admin) is an
       // admin-only tool, not covered by a per-user screen permission.
-      if (isAdmin)
-        _MenuTile(
-          title: 'Admin Console',
-          icon: Icons.admin_panel_settings_rounded,
-          color: const Color(0xFF00695C),
-          onTap: () => Get.to(() => const AdminConsoleScreen()),
-        ),
+      _MenuTile(
+        title: 'Admin Console',
+        icon: Icons.admin_panel_settings_rounded,
+        color: const Color(0xFF00695C),
+        locked: !isAdmin,
+        onTap: () => Get.to(() => const AdminConsoleScreen()),
+        anim: _IconAnim.fadePulse,
+      ),
     ];
 
     return Scaffold(
@@ -164,67 +179,206 @@ class OfficeHubScreen extends StatelessWidget {
           const SizedBox(width: 4),
         ],
       ),
-      body: tiles.isEmpty
-          ? const Center(
-              child: Padding(
-                padding: EdgeInsets.all(24),
-                child: Text(
-                  'You don\'t have access to any Office modules yet.\nAsk an admin to grant permissions.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Color(0xFF7C8A97)),
-                ),
-              ),
-            )
-          : GridView.count(
-              padding: const EdgeInsets.all(14),
-              crossAxisCount: 2,
-              crossAxisSpacing: 14,
-              mainAxisSpacing: 14,
-              childAspectRatio: 1.05,
-              children: tiles.map((t) => _MenuTileWidget(tile: t)).toList(),
-            ),
+      body: GridView.count(
+        padding: const EdgeInsets.all(14),
+        crossAxisCount: 2,
+        crossAxisSpacing: 14,
+        mainAxisSpacing: 14,
+        childAspectRatio: 1.05,
+        children: tiles.map((t) => _MenuTileWidget(tile: t)).toList(),
+      ),
     );
   }
 }
+
+// Which idle animation a tile's icon plays. Chosen per-tile (see the
+// `tiles` list above) — kept as a simple enum + AnimationController
+// implementation rather than a third-party package (flutter_animate etc.)
+// since this project's pubspec isn't available here to add a dependency.
+enum _IconAnim { pulse, wiggle, float, bounce, glow, spin, fadePulse }
 
 class _MenuTile {
   final String title;
   final IconData icon;
   final Color color;
+  final bool locked;
   final VoidCallback onTap;
-  _MenuTile(
-      {required this.title,
-      required this.icon,
-      required this.color,
-      required this.onTap});
+  final _IconAnim? anim;
+  _MenuTile({
+    required this.title,
+    required this.icon,
+    required this.color,
+    required this.onTap,
+    this.locked = false,
+    this.anim,
+  });
 }
 
 class _MenuTileWidget extends StatelessWidget {
   final _MenuTile tile;
   const _MenuTileWidget({required this.tile});
 
+  void _handleTap(BuildContext context) {
+    if (tile.locked) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              "No permission — you can't access '${tile.title}'. Ask an admin to grant it."),
+          backgroundColor: Colors.red.shade700,
+        ),
+      );
+      return;
+    }
+    tile.onTap();
+  }
+
   @override
   Widget build(BuildContext context) {
+    // Locked tiles stay visible (so people know the module exists and
+    // who to ask) but read as dimmed/greyed with a lock badge, and tapping
+    // shows the "no permission" message instead of opening the screen.
+    final color = tile.locked ? Colors.blueGrey.shade300 : tile.color;
     return Material(
-      color: tile.color,
+      color: color,
       borderRadius: BorderRadius.circular(20),
       child: InkWell(
         borderRadius: BorderRadius.circular(20),
-        onTap: tile.onTap,
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+        onTap: () => _handleTap(context),
+        child: Stack(
           children: [
-            Icon(tile.icon, color: Colors.white, size: 40),
-            const SizedBox(height: 12),
-            Text(tile.title,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  tile.anim != null
+                      ? _AnimatedTileIcon(icon: tile.icon, anim: tile.anim!)
+                      : Icon(tile.icon, color: Colors.white, size: 36),
+                  const SizedBox(height: 8),
+                  Flexible(
+                    child: Text(tile.title,
+                        textAlign: TextAlign.center,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            height: 1.2,
+                            fontWeight: FontWeight.w700)),
+                  ),
+                ],
+              ),
+            ),
+            if (tile.locked)
+              const Positioned(
+                top: 8,
+                right: 8,
+                child:
+                    Icon(Icons.lock_rounded, color: Colors.white70, size: 18),
+              ),
           ],
         ),
       ),
+    );
+  }
+}
+
+// Plays one continuous idle animation on a tile's icon — no extra package
+// (e.g. flutter_animate) needed, just a single AnimationController driven
+// 0→1 (repeating, reversed for everything except Spin) and reinterpreted
+// per style in build(). Each tile picks its style via `_MenuTile.anim`.
+class _AnimatedTileIcon extends StatefulWidget {
+  final IconData icon;
+  final _IconAnim anim;
+  const _AnimatedTileIcon({required this.icon, required this.anim});
+
+  @override
+  State<_AnimatedTileIcon> createState() => _AnimatedTileIconState();
+}
+
+class _AnimatedTileIconState extends State<_AnimatedTileIcon>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+
+  Duration get _duration {
+    switch (widget.anim) {
+      case _IconAnim.pulse:
+        return const Duration(milliseconds: 1100);
+      case _IconAnim.wiggle:
+        return const Duration(milliseconds: 800);
+      case _IconAnim.float:
+        return const Duration(milliseconds: 1500);
+      case _IconAnim.bounce:
+        return const Duration(milliseconds: 900);
+      case _IconAnim.glow:
+        return const Duration(milliseconds: 1200);
+      case _IconAnim.spin:
+        return const Duration(milliseconds: 3500);
+      case _IconAnim.fadePulse:
+        return const Duration(milliseconds: 1300);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: _duration);
+    if (widget.anim == _IconAnim.spin) {
+      _c.repeat();
+    } else {
+      _c.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = Icon(widget.icon, color: Colors.white, size: 36);
+    return AnimatedBuilder(
+      animation: _c,
+      child: icon,
+      builder: (context, child) {
+        final t = _c.value;
+        switch (widget.anim) {
+          case _IconAnim.pulse:
+            return Transform.scale(scale: 1.0 + 0.12 * t, child: child);
+          case _IconAnim.wiggle:
+            return Transform.rotate(angle: (t * 2 - 1) * 0.14, child: child);
+          case _IconAnim.float:
+            return Transform.translate(offset: Offset(0, -6 * t), child: child);
+          case _IconAnim.bounce:
+            return Transform.translate(
+              offset: Offset(0, -10 * Curves.easeOut.transform(t)),
+              child: child,
+            );
+          case _IconAnim.glow:
+            return Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.white.withOpacity(0.55 * t),
+                    blurRadius: 4 + 16 * t,
+                    spreadRadius: 1 + 5 * t,
+                  ),
+                ],
+              ),
+              child: child,
+            );
+          case _IconAnim.spin:
+            return Transform.rotate(angle: t * 2 * 3.1415926535, child: child);
+          case _IconAnim.fadePulse:
+            return Opacity(
+              opacity: 1.0 - 0.5 * t,
+              child: Transform.scale(scale: 1.0 - 0.1 * t, child: child),
+            );
+        }
+      },
     );
   }
 }

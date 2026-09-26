@@ -12,6 +12,13 @@ import 'package:form_app/user_permissions.dart';
 import 'package:form_app/auth_service.dart';
 
 class Step2 extends StatefulWidget {
+  // True when opened from the Dispatch screen's "Update Packing" shortcut —
+  // on a successful save this pops back to that screen (instead of staying
+  // here for another packing entry), so the dispatcher lands right back on
+  // Stage 3 with their selection intact and the just-packed invoice ready
+  // to pick up on refresh.
+  final bool returnAfterSave;
+  const Step2({super.key, this.returnAfterSave = false});
   @override
   _Step2State createState() => _Step2State();
 }
@@ -26,6 +33,13 @@ class _Step2State extends State<Step2> {
   final _garageSlipCtrl = TextEditingController();
   String? _selectedTransport;
   List<String> _transportList = [];
+  // Local Supply (Self Vehicle) — no real LR/Garage Slip exists for these,
+  // so LR/Garage Slip get greyed out and skipped instead of accepting a
+  // placeholder like "local"/"DDL". That placeholder text was the actual
+  // bug: several unrelated local-delivery invoices all had the SAME literal
+  // LR text, so "Add Invoice to Existing Packing" (which groups invoices by
+  // matching LR number) was treating them as one shared shipment.
+  bool _isLocalDelivery = false;
 
   Set<String> selectedInvoices = {};
   List<InvoiceData> invoices = [];
@@ -39,7 +53,8 @@ class _Step2State extends State<Step2> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => guardScreenView(ScreenKeys.step2, label: 'Packing'));
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => guardScreenView(ScreenKeys.step2, label: 'Packing'));
     _fetchInvoices();
     _lrDateCtrl.text = DateFormat('dd-MM-yyyy').format(DateTime.now());
     _packCaseCtrl.addListener(_calcTotal);
@@ -59,6 +74,18 @@ class _Step2State extends State<Step2> {
     final pack = int.tryParse(_packCaseCtrl.text) ?? 0;
     final loose = int.tryParse(_looseCaseCtrl.text) ?? 0;
     _totalCaseCtrl.text = (pack + loose).toString();
+  }
+
+  // Local Supply's LR Number is auto-filled as "local-<invoice number>" —
+  // a single invoice's own number, or any one of a tagged group's (the
+  // first selected) — so every local delivery gets a unique LR text
+  // instead of the old shared placeholder ("local"/"DDL") that made
+  // unrelated local deliveries falsely group together. Re-run this
+  // whenever the invoice selection changes while Local Supply is checked.
+  void _syncLocalLrNumber() {
+    if (!_isLocalDelivery) return;
+    _lrNumberCtrl.text =
+        selectedInvoices.isNotEmpty ? 'local-${selectedInvoices.first}' : '';
   }
 
   Future<void> _fetchInvoices() async {
@@ -257,8 +284,15 @@ class _Step2State extends State<Step2> {
                       builder: (context) => SingleChildScrollView(
                         keyboardDismissBehavior:
                             ScrollViewKeyboardDismissBehavior.onDrag,
-                        padding: EdgeInsets.fromLTRB(12, 12, 12,
-                            MediaQuery.of(context).viewInsets.bottom + 24),
+                        // Fixed padding — the Scaffold above already has
+                        // resizeToAvoidBottomInset: true, which resizes the
+                        // whole body to keep clear of the keyboard. Adding
+                        // MediaQuery.viewInsets.bottom again here on top of
+                        // that double-compensated on every frame of the
+                        // keyboard's open/close animation, which is what was
+                        // making the field being edited jump/scroll out of
+                        // view instead of settling in place.
+                        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
                         child: Form(
                           key: _formKey,
                           child: Column(
@@ -326,7 +360,7 @@ class _Step2State extends State<Step2> {
                                               BorderRadius.circular(8),
                                           child: ConstrainedBox(
                                             constraints: const BoxConstraints(
-                                                maxHeight: 320),
+                                                maxHeight: 220),
                                             child: ListView.builder(
                                               padding: EdgeInsets.zero,
                                               shrinkWrap: true,
@@ -434,6 +468,7 @@ class _Step2State extends State<Step2> {
                                         selectedInvoices.add(inv.invoiceNumber);
                                         selectedInvoicesIdList.add(inv.id);
                                         _updateEwayControllers();
+                                        _syncLocalLrNumber();
                                         _autocompleteKey =
                                             UniqueKey(); // clears search bar
                                         // Auto-fill transport from first selected invoice
@@ -474,6 +509,7 @@ class _Step2State extends State<Step2> {
                                                       selectedInvoicesIdList
                                                           .remove(d.id);
                                                     _updateEwayControllers();
+                                                    _syncLocalLrNumber();
                                                   });
                                                 },
                                               ))
@@ -738,16 +774,74 @@ class _Step2State extends State<Step2> {
                                       )),
                                     ]),
                                     const SizedBox(height: 12),
-                                    // LR + Garage Slip: at least one is required
+                                    // LR + Garage Slip: at least one is
+                                    // required, unless Local Supply is checked
+                                    // — a local/self-vehicle delivery has
+                                    // neither, so both are greyed out instead
+                                    // of taking a placeholder like "local" or
+                                    // "DDL" (which made unrelated local
+                                    // deliveries falsely group together under
+                                    // "Add Invoice to Existing Packing",
+                                    // since that groups by matching LR text).
                                     Builder(builder: (ctx) {
                                       return Column(
                                           crossAxisAlignment:
                                               CrossAxisAlignment.start,
                                           children: [
+                                            CheckboxListTile(
+                                              value: _isLocalDelivery,
+                                              onChanged: (val) {
+                                                setState(() {
+                                                  _isLocalDelivery =
+                                                      val ?? false;
+                                                  if (_isLocalDelivery) {
+                                                    // Auto-fill, unique per
+                                                    // invoice — see
+                                                    // _syncLocalLrNumber.
+                                                    _syncLocalLrNumber();
+                                                    _garageSlipCtrl.clear();
+                                                  } else {
+                                                    // Was auto-filled, not
+                                                    // typed — clear so a real
+                                                    // LR can be entered.
+                                                    _lrNumberCtrl.clear();
+                                                  }
+                                                });
+                                                ctx
+                                                    .findAncestorStateOfType<
+                                                        FormState>()
+                                                    ?.validate();
+                                              },
+                                              contentPadding: EdgeInsets.zero,
+                                              controlAffinity:
+                                                  ListTileControlAffinity
+                                                      .leading,
+                                              dense: true,
+                                              activeColor:
+                                                  AppTheme.stagePacking,
+                                              title: const Text(
+                                                  'Local Supply (Self Vehicle)',
+                                                  style: TextStyle(
+                                                      fontSize: 13,
+                                                      fontWeight:
+                                                          FontWeight.w700)),
+                                              subtitle: const Text(
+                                                  'LR auto-set to "local-<invoice no.>" — Garage Slip not needed',
+                                                  style:
+                                                      TextStyle(fontSize: 11)),
+                                            ),
+                                            const SizedBox(height: 4),
                                             Row(children: [
                                               Expanded(
                                                   child: TextFormField(
                                                 controller: _lrNumberCtrl,
+                                                // Greyed out and auto-filled
+                                                // while Local Supply is
+                                                // checked — validator is
+                                                // unchanged, the auto-fill
+                                                // satisfies it since every
+                                                // invoice number is unique.
+                                                enabled: !_isLocalDelivery,
                                                 decoration:
                                                     const InputDecoration(
                                                         labelText: 'LR Number',
@@ -775,21 +869,28 @@ class _Step2State extends State<Step2> {
                                                 readOnly: true,
                                                 onTap: _pickDate,
                                                 decoration: const InputDecoration(
-                                                    labelText: 'LR Date',
+                                                    labelText: 'LR Date *',
                                                     prefixIcon: Icon(Icons
                                                         .calendar_today_rounded)),
+                                                validator: (v) => v == null ||
+                                                        v.trim().isEmpty
+                                                    ? 'Required'
+                                                    : null,
                                               )),
                                             ]),
                                             const SizedBox(height: 12),
                                             TextFormField(
                                               controller: _garageSlipCtrl,
+                                              enabled: !_isLocalDelivery,
                                               decoration: InputDecoration(
                                                 labelText: 'Garage Slip No.',
                                                 prefixIcon: const Icon(
                                                     Icons.receipt_rounded),
-                                                helperText:
-                                                    'Enter if LR not yet received',
-                                                suffixIcon: _lrNumberCtrl.text
+                                                helperText: _isLocalDelivery
+                                                    ? 'Not needed for local supply'
+                                                    : 'Enter if LR not yet received',
+                                                suffixIcon: !_isLocalDelivery &&
+                                                        _lrNumberCtrl.text
                                                             .trim()
                                                             .isEmpty &&
                                                         _garageSlipCtrl.text
@@ -854,8 +955,11 @@ class _Step2State extends State<Step2> {
                     )), // closes Expanded + Builder
           if (selectedInvoices.isNotEmpty)
             Padding(
-              padding: EdgeInsets.fromLTRB(
-                  12, 8, 12, MediaQuery.of(context).viewInsets.bottom + 12),
+              // Fixed padding — see the SingleChildScrollView above for why
+              // adding MediaQuery.viewInsets.bottom here was redundant with
+              // the Scaffold's own resizeToAvoidBottomInset and caused the
+              // jumpy scroll while typing.
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
               child: SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
@@ -863,7 +967,10 @@ class _Step2State extends State<Step2> {
                     backgroundColor: AppTheme.stagePacking,
                     padding: const EdgeInsets.symmetric(vertical: 16),
                   ),
-                  onPressed: (isSaving || !AuthService.to.perms.canUpdate(ScreenKeys.step2)) ? null : _submit,
+                  onPressed: (isSaving ||
+                          !AuthService.to.perms.canUpdate(ScreenKeys.step2))
+                      ? null
+                      : _submit,
                   icon: isSaving
                       ? const SizedBox(
                           width: 18,
@@ -1786,6 +1893,15 @@ class _Step2State extends State<Step2> {
     if (success) {
       Get.snackbar('Saved!', 'Packing details saved',
           backgroundColor: AppTheme.stagePacking, colorText: Colors.white);
+      if (widget.returnAfterSave) {
+        // Opened from Dispatch's "Update Packing" shortcut — go straight
+        // back there instead of staying here for another packing entry.
+        // That screen refreshes its own invoice list on return, so the
+        // invoice just packed shows up without the dispatcher pressing
+        // anything.
+        if (mounted) Get.back();
+        return;
+      }
       setState(() {
         selectedInvoices.clear();
         selectedInvoicesIdList.clear();
@@ -1797,6 +1913,7 @@ class _Step2State extends State<Step2> {
         _lrNumberCtrl.clear();
         _garageSlipCtrl.clear();
         _selectedTransport = null;
+        _isLocalDelivery = false;
       });
       _fetchInvoices();
     } else {

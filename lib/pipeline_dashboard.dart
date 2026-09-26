@@ -6,7 +6,6 @@ import 'package:form_app/permission_guard.dart';
 import 'package:form_app/user_permissions.dart';
 import 'package:form_app/invoice_series_config.dart';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 import 'package:intl/intl.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,9 +64,12 @@ class _PipelineDashboardState extends State<PipelineDashboard>
   int _pulseFY = InvoiceSeriesConfig.financialYearOf(DateTime.now());
   int? _pulseYear = DateTime.now().year;
   int? _pulseMonth = DateTime.now().month;
-  String _pulseScope = 'global'; // 'global' | 'company'
-  String? _pulseFocusCompany; // company NAME used for company-scope funnel
-  int? _pulseStageFilter; // tapped gauge stage, or null
+  String _pulseCompany =
+      'All'; // Global Selection company filter — 'All' or a company name
+  int?
+      _pulseStageFilter; // tapped gauge stage, or null (6 = Telecalling, display-only)
+  String?
+      _pulseAgingFilter; // tapped Aging Summary bucket: '1-3' | '4-7' | '8+' | null
 
   List<InvoiceSeriesConfig> _pulseSeries = [];
   Map<String, int> _pulseMissingByCompany = {}; // companyId -> total missing
@@ -227,14 +229,56 @@ class _PipelineDashboardState extends State<PipelineDashboard>
   }
 
   List<InvoiceAcknowledgementData> get _pulsePool {
-    if (_pulseYear == null) return _pulseInvoices;
-    return _pulseInvoices.where((inv) {
-      if (inv.timestamp <= 0) return false;
-      final d = DateTime.fromMillisecondsSinceEpoch(inv.timestamp);
-      if (d.year != _pulseYear) return false;
-      if (_pulseMonth != null && d.month != _pulseMonth) return false;
-      return true;
-    }).toList();
+    Iterable<InvoiceAcknowledgementData> pool = _pulseInvoices;
+    if (_pulseYear != null) {
+      pool = pool.where((inv) {
+        if (inv.timestamp <= 0) return false;
+        final d = DateTime.fromMillisecondsSinceEpoch(inv.timestamp);
+        if (d.year != _pulseYear) return false;
+        if (_pulseMonth != null && d.month != _pulseMonth) return false;
+        return true;
+      });
+    }
+    if (_pulseCompany != 'All') {
+      pool = pool.where((inv) => inv.companyName == _pulseCompany);
+    }
+    return pool.toList();
+  }
+
+  // Stage 6 (Telecalling) uses a separate model/endpoint — scoped by the same
+  // Global Selection (year/month/company) for a consistent gauge, but shown
+  // display-only in Stage Pulse since it can't feed the same invoice-level
+  // company/party drill-down as stages 1-5.
+  List<InvoiceData> get _pulseTelecallPool {
+    Iterable<InvoiceData> pool = _telecallInvoices;
+    if (_pulseYear != null) {
+      pool = pool.where((inv) {
+        if (inv.timestamp <= 0) return false;
+        final d = DateTime.fromMillisecondsSinceEpoch(inv.timestamp);
+        if (d.year != _pulseYear) return false;
+        if (_pulseMonth != null && d.month != _pulseMonth) return false;
+        return true;
+      });
+    }
+    if (_pulseCompany != 'All') {
+      pool = pool.where((inv) => inv.companyName == _pulseCompany);
+    }
+    return pool.toList();
+  }
+
+  // Aging: days since the invoice was raised, for invoices not yet completed
+  // (stage < 5) — the only "pending" timestamp the data model actually has.
+  int _pendingDays(InvoiceAcknowledgementData inv) {
+    if (inv.timestamp <= 0) return 0;
+    return DateTime.now()
+        .difference(DateTime.fromMillisecondsSinceEpoch(inv.timestamp))
+        .inDays;
+  }
+
+  Color _pendingColor(int days) {
+    if (days > 7) return AppTheme.danger;
+    if (days > 3) return AppTheme.warning;
+    return AppTheme.success;
   }
 
   String? _companyIdForName(String name) {
@@ -934,30 +978,46 @@ class _PipelineDashboardState extends State<PipelineDashboard>
     final stageReached = <int, int>{
       for (int s = 1; s <= 5; s++) s: pool.where((i) => i.stage >= s).length,
     };
+    final telecallPool = _pulseTelecallPool;
+    final telecallTotal = telecallPool.length;
+    final telecallDelivered =
+        telecallPool.where((i) => i.telecallStatus == 'delivered').length;
 
-    final funnelPool = _pulseScope == 'company' && _pulseFocusCompany != null
-        ? pool.where((i) => i.companyName == _pulseFocusCompany).toList()
-        : pool;
-    final funnelTotal = funnelPool.length;
     final levels = <double>[1.0];
     for (int s = 1; s <= 5; s++) {
-      final r = funnelPool.where((i) => i.stage >= s).length;
-      levels.add(funnelTotal > 0 ? r / funnelTotal : 0.0);
+      final r = pool.where((i) => i.stage >= s).length;
+      levels.add(total > 0 ? r / total : 0.0);
     }
-    final funnelCounts = List.generate(
-        5, (i) => funnelPool.where((inv) => inv.stage >= i + 1).length);
+    final funnelCounts =
+        List.generate(5, (i) => pool.where((inv) => inv.stage >= i + 1).length);
 
-    final companyGroups = _groupByCompany(_pulseStageFilter != null
+    final stagePool = _pulseStageFilter != null && _pulseStageFilter! <= 5
         ? pool.where((i) => i.stage >= _pulseStageFilter!).toList()
-        : pool);
-    final companyTotal = companyGroups.values.fold(0, (s, l) => s + l.length);
+        : pool;
+    final companyGroups = _groupByCompany(stagePool);
+    final breakdownTotal = companyGroups.values.fold(0, (s, l) => s + l.length);
 
-    final years = _pulseInvoices
-        .where((i) => i.timestamp > 0)
-        .map((i) => DateTime.fromMillisecondsSinceEpoch(i.timestamp).year)
-        .toSet()
-        .toList()
-      ..sort((a, b) => b.compareTo(a));
+    // Invoices by Company — sized by VALUE share (not just count).
+    final companyByValue = companyGroups.entries.toList()
+      ..sort((a, b) => _totalAmount(b.value).compareTo(_totalAmount(a.value)));
+    final totalValueAll = _totalAmount(pool);
+
+    // Top Parties — by count AND by value (ranks can differ).
+    final allPartyGroups = _groupByParty(pool);
+    final partyByCount = allPartyGroups.entries.toList()
+      ..sort((a, b) => b.value.length.compareTo(a.value.length));
+    final partyByValue = allPartyGroups.entries.toList()
+      ..sort((a, b) => _totalAmount(b.value).compareTo(_totalAmount(a.value)));
+
+    // Aging / Top Overdue — days since raised, for invoices not yet Complete.
+    final openPool = pool.where((i) => i.stage < 5).toList();
+    final aging1to3 = openPool.where((i) => _pendingDays(i) <= 3).length;
+    final aging4to7 = openPool
+        .where((i) => _pendingDays(i) > 3 && _pendingDays(i) <= 7)
+        .length;
+    final aging8plus = openPool.where((i) => _pendingDays(i) > 7).length;
+    final topOverdue = [...openPool]
+      ..sort((a, b) => _pendingDays(b).compareTo(_pendingDays(a)));
 
     return RefreshIndicator(
       onRefresh: () async {
@@ -966,60 +1026,134 @@ class _PipelineDashboardState extends State<PipelineDashboard>
       child: ListView(
           padding: const EdgeInsets.fromLTRB(12, 14, 12, 40),
           children: [
-            // ── Global selection bar ─────────────────────────────────────────
+            // ── Global Selection — Year (top-right) + Company & Month side by side
             _card(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                  _cardHeader(
-                      'Global Selection', Icons.tune_rounded, AppTheme.primary,
-                      subtitle: _pulseYear == null
-                          ? 'All time'
-                          : (_pulseMonth == null
-                              ? '$_pulseYear (full year)'
-                              : DateFormat('MMMM yyyy').format(
-                                  DateTime(_pulseYear!, _pulseMonth!)))),
+                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Expanded(
+                        child: _cardHeader('Global Selection',
+                            Icons.tune_rounded, AppTheme.primary,
+                            subtitle: (_pulseCompany == 'All'
+                                    ? 'All companies'
+                                    : _pulseCompany) +
+                                ' · ' +
+                                (_pulseYear == null
+                                    ? 'All time'
+                                    : (_pulseMonth == null
+                                        ? '$_pulseYear (full year)'
+                                        : DateFormat('MMM yyyy').format(
+                                            DateTime(
+                                                _pulseYear!, _pulseMonth!)))))),
+                    _pulseYearDropdown(),
+                  ]),
                   const SizedBox(height: 10),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(children: [
-                      _pulseChip(
-                          'All Time',
-                          _pulseYear == null,
-                          () => setState(() {
-                                _pulseYear = null;
-                                _pulseMonth = null;
-                              })),
-                      ...years.map((y) => _pulseChip(
-                          '$y',
-                          _pulseYear == y,
-                          () => setState(() {
-                                _pulseYear = y;
-                                _pulseMonth = null;
-                              }))),
-                    ]),
-                  ),
-                  if (_pulseYear != null) ...[
-                    const SizedBox(height: 8),
-                    SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(children: [
-                        _pulseChip('All months', _pulseMonth == null,
-                            () => setState(() => _pulseMonth = null)),
-                        ...List.generate(12, (i) {
-                          final m = i + 1;
-                          return _pulseChip(
-                              DateFormat('MMM').format(DateTime(2000, m)),
-                              _pulseMonth == m,
-                              () => setState(() => _pulseMonth = m));
-                        }),
-                      ]),
-                    ),
+                  Row(children: [
+                    Expanded(child: _pulseCompanyDropdown()),
+                    const SizedBox(width: 10),
+                    Expanded(child: _pulseMonthDropdown()),
+                  ]),
+                ])),
+            const SizedBox(height: 10),
+
+            // ── Aging Summary ────────────────────────────────────────────────
+            _card(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  _cardHeader('Aging Summary', Icons.hourglass_bottom_rounded,
+                      AppTheme.danger,
+                      subtitle: 'tap a bucket to see those invoices'),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    Expanded(
+                        child: _agingBucket(
+                            '$aging1to3', '1–3 days', AppTheme.success,
+                            active: _pulseAgingFilter == '1-3',
+                            onTap: () => setState(() => _pulseAgingFilter =
+                                _pulseAgingFilter == '1-3' ? null : '1-3'))),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: _agingBucket(
+                            '$aging4to7', '4–7 days', AppTheme.warning,
+                            active: _pulseAgingFilter == '4-7',
+                            onTap: () => setState(() => _pulseAgingFilter =
+                                _pulseAgingFilter == '4-7' ? null : '4-7'))),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: _agingBucket(
+                            '$aging8plus', '8+ days', AppTheme.danger,
+                            active: _pulseAgingFilter == '8+',
+                            onTap: () => setState(() => _pulseAgingFilter =
+                                _pulseAgingFilter == '8+' ? null : '8+'))),
+                  ]),
+                  if (_pulseAgingFilter != null) ...[
+                    const SizedBox(height: 10),
+                    Builder(builder: (context) {
+                      final bucketColor = _pulseAgingFilter == '1-3'
+                          ? AppTheme.success
+                          : (_pulseAgingFilter == '4-7'
+                              ? AppTheme.warning
+                              : AppTheme.danger);
+                      final bucketLabel = _pulseAgingFilter == '1-3'
+                          ? '1–3 days'
+                          : (_pulseAgingFilter == '4-7'
+                              ? '4–7 days'
+                              : '8+ days');
+                      final inBucket = openPool.where((i) {
+                        final d = _pendingDays(i);
+                        if (_pulseAgingFilter == '1-3') return d <= 3;
+                        if (_pulseAgingFilter == '4-7') return d > 3 && d <= 7;
+                        return d > 7;
+                      }).toList()
+                        ..sort((a, b) =>
+                            _pendingDays(b).compareTo(_pendingDays(a)));
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 10),
+                        decoration: BoxDecoration(
+                            color: bucketColor.withValues(alpha: 0.05),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                                color: bucketColor.withValues(alpha: 0.18))),
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                  '$bucketLabel — ${inBucket.length} invoice${inBucket.length == 1 ? '' : 's'} pending',
+                                  style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: bucketColor)),
+                              const SizedBox(height: 8),
+                              if (inBucket.isEmpty)
+                                const Text('Nothing in this bucket.',
+                                    style: TextStyle(
+                                        color: AppTheme.textSecondary,
+                                        fontSize: 11))
+                              else
+                                ...inBucket.take(8).map((inv) => Padding(
+                                    padding: const EdgeInsets.only(bottom: 6),
+                                    child: GestureDetector(
+                                        onTap: () => _showInvoiceDetail(inv),
+                                        child: _InvoiceRow(
+                                            inv: inv,
+                                            color:
+                                                AppStages.color(inv.stage))))),
+                              if (inBucket.length > 8)
+                                Text('+ ${inBucket.length - 8} more',
+                                    style: const TextStyle(
+                                        fontSize: 10.5,
+                                        color: AppTheme.textSecondary)),
+                            ]),
+                      );
+                    }),
                   ],
                 ])),
             const SizedBox(height: 10),
 
-            // ── Stage gauges ──────────────────────────────────────────────────
+            // ── Stage gauges (S1-S5 live; S6 Telecalling display-only) ────────
             _card(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -1027,135 +1161,179 @@ class _PipelineDashboardState extends State<PipelineDashboard>
                   _cardHeader(
                       'Stage Pulse', Icons.speed_rounded, AppTheme.primary,
                       subtitle:
-                          '$total total invoices  ·  tap a stage to filter company breakdown'),
+                          '$total total invoices  ·  tap a stage to see who\'s there'),
                   const SizedBox(height: 10),
-                  Row(
-                      children: List.generate(5, (i) {
-                    final s = i + 1;
-                    return Expanded(
-                        child: Padding(
-                      padding: EdgeInsets.only(right: i < 4 ? 6 : 0),
-                      child: _StageGauge(
-                        stage: s,
-                        reached: stageReached[s] ?? 0,
-                        total: total,
-                        color: AppStages.color(s),
-                        active: _pulseStageFilter == s,
-                        onTap: () => setState(() => _pulseStageFilter =
-                            _pulseStageFilter == s ? null : s),
-                      ),
-                    ));
-                  })),
+                  LayoutBuilder(builder: (context, constraints) {
+                    // Six fixed-size gauges never fit a phone-width row —
+                    // size them from the space actually available instead
+                    // of a hardcoded diameter, so nothing overflows/overlaps.
+                    const gap = 4.0;
+                    final gaugeSize = ((constraints.maxWidth - gap * 5) / 6)
+                        .clamp(40.0, 62.0);
+                    return Row(
+                        children: List.generate(6, (i) {
+                      final s = i + 1;
+                      final isTelecall = s == 6;
+                      return Expanded(
+                          child: Padding(
+                        padding: EdgeInsets.only(right: i < 5 ? gap : 0),
+                        child: _StageGauge(
+                          stage: s,
+                          reached: isTelecall
+                              ? telecallDelivered
+                              : (stageReached[s] ?? 0),
+                          total: isTelecall ? telecallTotal : total,
+                          color: AppStages.color(s),
+                          active: _pulseStageFilter == s,
+                          size: gaugeSize,
+                          onTap: () => setState(() => _pulseStageFilter =
+                              _pulseStageFilter == s ? null : s),
+                        ),
+                      ));
+                    }));
+                  }),
+                  if (_pulseStageFilter != null) ...[
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 10),
+                      decoration: BoxDecoration(
+                          color: AppStages.color(_pulseStageFilter!)
+                              .withValues(alpha: 0.05),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                              color: AppStages.color(_pulseStageFilter!)
+                                  .withValues(alpha: 0.18))),
+                      child: _pulseStageFilter == 6
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                    'Telecalling — $telecallDelivered of $telecallTotal delivered-confirmed',
+                                    style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: AppStages.color(6))),
+                                const SizedBox(height: 4),
+                                const Text(
+                                    'Uses its own record, so it isn\'t part of the company breakdown below.',
+                                    style: TextStyle(
+                                        fontSize: 10.5,
+                                        color: AppTheme.textSecondary)),
+                                const SizedBox(height: 8),
+                                if (telecallPool.isEmpty)
+                                  const Text(
+                                      'No telecalling-eligible invoices.',
+                                      style: TextStyle(
+                                          color: AppTheme.textSecondary,
+                                          fontSize: 11))
+                                else
+                                  ...telecallPool.take(8).map((inv) => Padding(
+                                      padding: const EdgeInsets.only(bottom: 6),
+                                      child: _TelecallInvoiceRow(inv: inv))),
+                                if (telecallPool.length > 8)
+                                  Text('+ ${telecallPool.length - 8} more',
+                                      style: const TextStyle(
+                                          fontSize: 10.5,
+                                          color: AppTheme.textSecondary)),
+                              ],
+                            )
+                          : Builder(builder: (context) {
+                              final s = _pulseStageFilter!;
+                              final atStage =
+                                  pool.where((i) => i.stage == s).toList();
+                              return Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                        'S$s · ${AppStages.label(s)} — ${atStage.length} invoice${atStage.length == 1 ? '' : 's'} currently here',
+                                        style: TextStyle(
+                                            fontSize: 11.5,
+                                            fontWeight: FontWeight.w700,
+                                            color: AppStages.color(s))),
+                                    const SizedBox(height: 8),
+                                    if (atStage.isEmpty)
+                                      const Text(
+                                          'Nothing currently at this stage.',
+                                          style: TextStyle(
+                                              color: AppTheme.textSecondary,
+                                              fontSize: 11))
+                                    else
+                                      ...atStage.take(8).map((inv) => Padding(
+                                          padding:
+                                              const EdgeInsets.only(bottom: 6),
+                                          child: GestureDetector(
+                                              onTap: () =>
+                                                  _showInvoiceDetail(inv),
+                                              child: _InvoiceRow(
+                                                  inv: inv,
+                                                  color: AppStages.color(s))))),
+                                    if (atStage.length > 8)
+                                      Text(
+                                          '+ ${atStage.length - 8} more — tap a company below for the full list.',
+                                          style: const TextStyle(
+                                              fontSize: 10.5,
+                                              color: AppTheme.textSecondary)),
+                                  ]);
+                            }),
+                    ),
+                  ],
                 ])),
             const SizedBox(height: 10),
 
-            // ── Funnel ────────────────────────────────────────────────────────
+            // ── Logistics Pipeline (stage drop-off, globally scoped) ───────────
             _card(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                  Row(children: [
-                    Expanded(
-                        child: _cardHeader('Logistics Pipeline',
-                            Icons.filter_alt_rounded, const Color(0xFF5C6BC0))),
-                    Text('Global',
-                        style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w700,
-                            color: _pulseScope == 'global'
-                                ? AppTheme.primary
-                                : AppTheme.textSecondary)),
-                    Switch(
-                        value: _pulseScope == 'company',
-                        activeColor: AppTheme.primary,
-                        onChanged: (v) => setState(
-                            () => _pulseScope = v ? 'company' : 'global')),
-                    Text('Company',
-                        style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w700,
-                            color: _pulseScope == 'company'
-                                ? AppTheme.primary
-                                : AppTheme.textSecondary)),
-                  ]),
-                  if (_pulseScope == 'company') ...[
-                    const SizedBox(height: 6),
-                    DropdownButtonHideUnderline(
-                        child: DropdownButton<String?>(
-                      value: _pulseFocusCompany,
-                      isDense: true,
-                      hint: const Text('Select a company',
-                          style: TextStyle(fontSize: 12)),
-                      items: _companies
-                          .map((c) => DropdownMenuItem<String?>(
-                              value: c.companyName,
-                              child: Text(c.companyName,
-                                  style: const TextStyle(fontSize: 12))))
-                          .toList(),
-                      onChanged: (v) => setState(() => _pulseFocusCompany = v),
-                    )),
-                  ],
+                  _cardHeader('Logistics Pipeline', Icons.filter_alt_rounded,
+                      const Color(0xFF5C6BC0)),
                   const SizedBox(height: 10),
-                  if (_pulseScope == 'company' && _pulseFocusCompany == null)
-                    const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 24),
-                        child: Center(
-                            child: Text(
-                                'Select a company to see its own pipeline.',
-                                style: TextStyle(
-                                    color: AppTheme.textSecondary,
-                                    fontSize: 12))))
-                  else
-                    SizedBox(
-                        height: 210,
-                        width: double.infinity,
-                        child: CustomPaint(
-                            painter: _FunnelPainter(
-                                levels: levels,
-                                colors: List.generate(
-                                    5, (i) => AppStages.color(i + 1)),
-                                counts: funnelCounts))),
+                  _PipelineStageBars(
+                      levels: levels,
+                      colors: List.generate(5, (i) => AppStages.color(i + 1)),
+                      counts: funnelCounts),
                 ])),
             const SizedBox(height: 10),
 
-            // ── Pie chart ─────────────────────────────────────────────────────
+            // ── Invoices by Company — pie by VALUE share, count + value + % ────
             _card(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                   _cardHeader('Invoices by Company', Icons.pie_chart_rounded,
-                      const Color(0xFF00897B)),
+                      const Color(0xFF00897B),
+                      subtitle:
+                          '$breakdownTotal invoices · ₹${_fmt(totalValueAll)} total'),
                   const SizedBox(height: 12),
                   Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
                     SizedBox(
                         width: 110,
                         height: 110,
-                        child: companyGroups.isEmpty
+                        child: companyByValue.isEmpty
                             ? const SizedBox.shrink()
                             : CustomPaint(
                                 painter: _PieChartPainter(
-                                    values: companyGroups.values
-                                        .map((l) => l.length.toDouble())
+                                    values: companyByValue
+                                        .map((e) => _totalAmount(e.value))
                                         .toList(),
-                                    colors: List.generate(companyGroups.length,
+                                    colors: List.generate(companyByValue.length,
                                         (i) => _pulsePalette(i))))),
                     const SizedBox(width: 16),
                     Expanded(
-                        child: companyGroups.isEmpty
+                        child: companyByValue.isEmpty
                             ? const Text('No data',
                                 style: TextStyle(color: AppTheme.textSecondary))
                             : Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
-                                children: companyGroups.entries
-                                    .toList()
-                                    .asMap()
-                                    .entries
-                                    .map((e) {
+                                children:
+                                    companyByValue.asMap().entries.map((e) {
                                   final idx = e.key;
                                   final name = e.value.key;
-                                  final count = e.value.value.length;
-                                  final pct = companyTotal > 0
-                                      ? (count / companyTotal * 100)
+                                  final invs = e.value.value;
+                                  final amt = _totalAmount(invs);
+                                  final pct = totalValueAll > 0
+                                      ? (amt / totalValueAll * 100)
                                       : 0.0;
                                   return Padding(
                                     padding: const EdgeInsets.only(bottom: 6),
@@ -1169,12 +1347,25 @@ class _PipelineDashboardState extends State<PipelineDashboard>
                                                   BorderRadius.circular(3))),
                                       const SizedBox(width: 7),
                                       Expanded(
-                                          child: Text(name,
-                                              style: const TextStyle(
-                                                  fontSize: 12,
-                                                  fontWeight: FontWeight.w600),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis)),
+                                          child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                            Text(name,
+                                                style: const TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight:
+                                                        FontWeight.w600),
+                                                maxLines: 1,
+                                                overflow:
+                                                    TextOverflow.ellipsis),
+                                            Text(
+                                                '${invs.length} inv · ₹${_fmt(amt)}',
+                                                style: const TextStyle(
+                                                    fontSize: 9.5,
+                                                    color: AppTheme
+                                                        .textSecondary)),
+                                          ])),
                                       Text('${pct.toStringAsFixed(0)}%',
                                           style: const TextStyle(
                                               fontSize: 11,
@@ -1184,6 +1375,115 @@ class _PipelineDashboardState extends State<PipelineDashboard>
                                   );
                                 }).toList())),
                   ]),
+                  const SizedBox(height: 6),
+                  const Text(
+                      '% is each company\'s share of total invoice value.',
+                      style: TextStyle(
+                          fontSize: 10.5, color: AppTheme.textSecondary)),
+                ])),
+            const SizedBox(height: 10),
+
+            // ── Top Parties — by count AND by value ────────────────────────────
+            _card(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  _cardHeader('Top Parties', Icons.emoji_events_rounded,
+                      const Color(0xFF7B1FA2),
+                      subtitle: 'by invoice count & by value'),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    Expanded(
+                        child: _topPartyDonut(
+                            title: 'By Count',
+                            entries: partyByCount,
+                            metric: (l) => l.length.toDouble(),
+                            centerLabel:
+                                '${allPartyGroups.values.fold(0, (s, l) => s + l.length)}',
+                            centerSub: 'invoices')),
+                    Container(width: 1, height: 150, color: AppTheme.divider),
+                    const SizedBox(width: 14),
+                    Expanded(
+                        child: _topPartyDonut(
+                            title: 'By Value',
+                            entries: partyByValue,
+                            metric: (l) => _totalAmount(l),
+                            centerLabel:
+                                '₹${_fmt(allPartyGroups.values.fold(0.0, (s, l) => s + _totalAmount(l)))}',
+                            centerSub: 'total')),
+                  ]),
+                  const SizedBox(height: 6),
+                  const Text(
+                      'Ranking can differ between the two — a party with fewer, larger orders can outrank one with more, smaller ones.',
+                      style: TextStyle(
+                          fontSize: 10.5, color: AppTheme.textSecondary)),
+                ])),
+            const SizedBox(height: 10),
+
+            // ── Top Overdue ─────────────────────────────────────────────────────
+            _card(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  _cardHeader('Top Overdue',
+                      Icons.local_fire_department_rounded, AppTheme.danger,
+                      subtitle: 'highest days-pending, for follow-up'),
+                  const SizedBox(height: 6),
+                  if (topOverdue.isEmpty)
+                    const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 10),
+                        child: Text('Nothing pending — all caught up.',
+                            style: TextStyle(color: AppTheme.textSecondary)))
+                  else
+                    ...topOverdue.take(5).map((inv) {
+                      final days = _pendingDays(inv);
+                      final color = _pendingColor(days);
+                      return GestureDetector(
+                        onTap: () => _showInvoiceDetail(inv),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              vertical: 8, horizontal: 4),
+                          decoration: const BoxDecoration(
+                              border: Border(
+                                  top: BorderSide(color: AppTheme.divider))),
+                          child: Row(children: [
+                            Expanded(
+                                child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                  Text(
+                                      '${inv.invoiceNumber} · ${inv.companyName}',
+                                      style: const TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w700),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis),
+                                  Text(
+                                      'S${inv.stage} · ${AppStages.label(inv.stage)} · ₹${inv.invoiceAmount}',
+                                      style: const TextStyle(
+                                          fontSize: 10,
+                                          color: AppTheme.textSecondary)),
+                                ])),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 3),
+                              margin: const EdgeInsets.only(left: 8),
+                              decoration: BoxDecoration(
+                                  color: color.withValues(alpha: 0.1),
+                                  borderRadius: BorderRadius.circular(9)),
+                              child: Text('${days}d',
+                                  style: TextStyle(
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: color)),
+                            ),
+                            const Icon(Icons.chevron_right_rounded,
+                                size: 16, color: AppTheme.textSecondary),
+                          ]),
+                        ),
+                      );
+                    }),
                 ])),
             const SizedBox(height: 10),
 
@@ -1192,11 +1492,12 @@ class _PipelineDashboardState extends State<PipelineDashboard>
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                  _cardHeader('Company Wise', Icons.business_rounded,
+                  _cardHeader('Company Pulse', Icons.business_rounded,
                       const Color(0xFF5C6BC0),
-                      subtitle: _pulseStageFilter != null
+                      subtitle: _pulseStageFilter != null &&
+                              _pulseStageFilter! <= 5
                           ? 'Showing invoices that reached S$_pulseStageFilter'
-                          : null),
+                          : '$breakdownTotal invoices · ₹${_fmt(totalValueAll)} total'),
                   const SizedBox(height: 10),
                   if (companyGroups.isEmpty)
                     const Text('No data',
@@ -1230,7 +1531,225 @@ class _PipelineDashboardState extends State<PipelineDashboard>
                       );
                     }),
                 ])),
+            const SizedBox(height: 10),
           ]),
+    );
+  }
+
+  Widget _agingBucket(String count, String label, Color color,
+          {bool active = false, VoidCallback? onTap}) =>
+      GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+          decoration: BoxDecoration(
+              color: color.withValues(alpha: active ? 0.20 : 0.10),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                  color: active ? color : Colors.transparent, width: 1.6)),
+          child: Column(children: [
+            Text(count,
+                style: TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.w800, color: color)),
+            const SizedBox(height: 2),
+            Text(label,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                    fontSize: 9.5, fontWeight: FontWeight.w700, color: color)),
+            const SizedBox(height: 2),
+            Icon(
+                active
+                    ? Icons.keyboard_arrow_up_rounded
+                    : Icons.keyboard_arrow_down_rounded,
+                size: 12,
+                color: color.withValues(alpha: 0.7)),
+          ]),
+        ),
+      );
+
+  Widget _topPartyDonut({
+    required String title,
+    required List<MapEntry<String, List<InvoiceAcknowledgementData>>> entries,
+    required double Function(List<InvoiceAcknowledgementData>) metric,
+    required String centerLabel,
+    required String centerSub,
+  }) {
+    final top = entries.take(5).toList();
+    final total = entries.fold(0.0, (s, e) => s + metric(e.value));
+    return Column(children: [
+      Text(title.toUpperCase(),
+          style: const TextStyle(
+              fontSize: 9.5,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.4,
+              color: AppTheme.textSecondary)),
+      const SizedBox(height: 8),
+      SizedBox(
+        width: 92,
+        height: 92,
+        child: top.isEmpty
+            ? const SizedBox.shrink()
+            : Stack(alignment: Alignment.center, children: [
+                CustomPaint(
+                    size: const Size(92, 92),
+                    painter: _PieChartPainter(
+                        values: top.map((e) => metric(e.value)).toList(),
+                        colors: List.generate(
+                            top.length, (i) => _pulsePalette(i)))),
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: const BoxDecoration(
+                      color: Colors.white, shape: BoxShape.circle),
+                  child: Center(
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Text(centerLabel,
+                        style: const TextStyle(
+                            fontSize: 12, fontWeight: FontWeight.w800)),
+                    Text(centerSub,
+                        style: const TextStyle(
+                            fontSize: 8, color: AppTheme.textSecondary)),
+                  ])),
+                ),
+              ]),
+      ),
+      const SizedBox(height: 10),
+      ...top.asMap().entries.map((e) {
+        final idx = e.key;
+        final name = e.value.key;
+        final val = metric(e.value.value);
+        final pct = total > 0 ? (val / total * 100) : 0.0;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 5),
+          child: Row(children: [
+            Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                    color: _pulsePalette(idx),
+                    borderRadius: BorderRadius.circular(4))),
+            const SizedBox(width: 6),
+            Expanded(
+                child: Text(name,
+                    style: const TextStyle(
+                        fontSize: 10.5, fontWeight: FontWeight.w600),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis)),
+            Text('${pct.toStringAsFixed(0)}%',
+                style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w800,
+                    color: _pulsePalette(idx))),
+          ]),
+        );
+      }),
+    ]);
+  }
+
+  Widget _pulseDropdownShell({required Widget child}) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFFEEF2F6),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFFE0E6EC)),
+        ),
+        child: child,
+      );
+
+  Widget _pulseYearDropdown() {
+    final years = List.generate(math.max(1, DateTime.now().year - 2025 + 1),
+        (i) => DateTime.now().year - i);
+    return _pulseDropdownShell(
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<int?>(
+          value: _pulseYear,
+          isDense: true,
+          icon: const Icon(Icons.keyboard_arrow_down_rounded,
+              size: 16, color: AppTheme.textSecondary),
+          style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              color: AppTheme.textPrimary),
+          items: [
+            const DropdownMenuItem<int?>(value: null, child: Text('All Time')),
+            ...years.map(
+                (y) => DropdownMenuItem<int?>(value: y, child: Text('$y'))),
+          ],
+          onChanged: (v) => setState(() {
+            _pulseYear = v;
+            if (v == null) _pulseMonth = null;
+          }),
+        ),
+      ),
+    );
+  }
+
+  Widget _pulseCompanyDropdown() {
+    return _pulseDropdownShell(
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: _pulseCompany,
+          isDense: true,
+          isExpanded: true,
+          icon: const Icon(Icons.keyboard_arrow_down_rounded,
+              size: 16, color: AppTheme.textSecondary),
+          style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              color: AppTheme.textPrimary),
+          items: [
+            const DropdownMenuItem<String>(value: 'All', child: Text('All')),
+            ..._companies.map((c) => DropdownMenuItem<String>(
+                value: c.companyName,
+                child: Text(c.companyName, overflow: TextOverflow.ellipsis))),
+          ],
+          onChanged: (v) => setState(() => _pulseCompany = v ?? 'All'),
+        ),
+      ),
+    );
+  }
+
+  Widget _pulseMonthDropdown() {
+    const monthNames = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec'
+    ];
+    return _pulseDropdownShell(
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<int?>(
+          value: _pulseYear == null ? null : _pulseMonth,
+          isDense: true,
+          isExpanded: true,
+          icon: const Icon(Icons.keyboard_arrow_down_rounded,
+              size: 16, color: AppTheme.textSecondary),
+          style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              color: AppTheme.textPrimary),
+          items: [
+            const DropdownMenuItem<int?>(
+                value: null, child: Text('All months')),
+            ...List.generate(
+                12,
+                (i) => DropdownMenuItem<int?>(
+                    value: i + 1, child: Text(monthNames[i]))),
+          ],
+          onChanged: _pulseYear == null
+              ? null
+              : (v) => setState(() => _pulseMonth = v),
+        ),
+      ),
     );
   }
 
@@ -2503,6 +3022,11 @@ class _StageGauge extends StatelessWidget {
   final Color color;
   final bool active;
   final VoidCallback onTap;
+  // Diameter of the arc circle, computed by the caller from the row's
+  // actual available width (LayoutBuilder) so 6 gauges never overflow a
+  // phone-width row — that overflow was what showed up as "overlapping"
+  // text, since a fixed 72px circle simply didn't fit 6-across.
+  final double size;
   const _StageGauge({
     required this.stage,
     required this.reached,
@@ -2510,16 +3034,18 @@ class _StageGauge extends StatelessWidget {
     required this.color,
     required this.active,
     required this.onTap,
+    this.size = 62,
   });
 
   @override
   Widget build(BuildContext context) {
     final pct = total > 0 ? reached / total : 0.0;
+    final pctFont = (size * 0.23).clamp(10.0, 15.0);
     return GestureDetector(
       onTap: onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
-        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(14),
@@ -2531,38 +3057,39 @@ class _StageGauge extends StatelessWidget {
               : null,
         ),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('S$stage · ${AppStages.label(stage)}',
+          Text('S$stage',
               style: TextStyle(
-                  fontSize: 9, fontWeight: FontWeight.w800, color: color),
+                  fontSize: 10, fontWeight: FontWeight.w800, color: color),
               maxLines: 1,
               overflow: TextOverflow.ellipsis),
-          const SizedBox(height: 6),
+          const SizedBox(height: 4),
           SizedBox(
-            width: 72,
-            height: 72,
+            width: size,
+            height: size,
             child: CustomPaint(
-              painter: _ArcGaugePainter(pct: pct, color: color),
+              painter:
+                  _ArcGaugePainter(pct: pct, color: color, stroke: size / 9),
               child: Center(
                   child: Column(mainAxisSize: MainAxisSize.min, children: [
                 Text('${(pct * 100).toStringAsFixed(0)}%',
                     style: TextStyle(
-                        fontSize: 16,
+                        fontSize: pctFont,
                         fontWeight: FontWeight.w800,
                         color: color)),
                 Text('$reached',
-                    style: const TextStyle(
-                        fontSize: 10,
+                    style: TextStyle(
+                        fontSize: (pctFont * 0.6).clamp(7.0, 10.0),
                         color: AppTheme.textSecondary,
                         fontWeight: FontWeight.w600)),
               ])),
             ),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 2),
           Icon(
               active
                   ? Icons.keyboard_arrow_up_rounded
                   : Icons.keyboard_arrow_down_rounded,
-              size: 14,
+              size: 12,
               color: color.withValues(alpha: 0.7)),
         ]),
       ),
@@ -2573,11 +3100,11 @@ class _StageGauge extends StatelessWidget {
 class _ArcGaugePainter extends CustomPainter {
   final double pct;
   final Color color;
-  _ArcGaugePainter({required this.pct, required this.color});
+  final double stroke;
+  _ArcGaugePainter({required this.pct, required this.color, this.stroke = 8.0});
 
   @override
   void paint(Canvas canvas, Size size) {
-    const stroke = 8.0;
     final rect = Rect.fromLTWH(
         stroke / 2, stroke / 2, size.width - stroke, size.height - stroke);
     final bg = Paint()
@@ -2600,67 +3127,107 @@ class _ArcGaugePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _ArcGaugePainter old) =>
-      old.pct != pct || old.color != color;
+      old.pct != pct || old.color != color || old.stroke != stroke;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Pulse tab — funnel painter (trapezoid stack, mirrors the stage strip's
-//  "reached at least this stage" percentages)
+//  Pulse tab — stage drop-off bars. Same underlying pattern as the old
+//  funnel (each row is "% of the pool that has reached at least this
+//  stage", so the numbers only ever shrink going down), just drawn as
+//  a clean stacked bar-list instead of a trapezoid, with the drop-off
+//  between consecutive stages called out explicitly instead of implied
+//  by the shape's taper — easier to scan and to tap.
 // ─────────────────────────────────────────────────────────────────────────────
-class _FunnelPainter extends CustomPainter {
+class _PipelineStageBars extends StatelessWidget {
   final List<double> levels; // length 6: levels[0]=1.0, levels[1..5]=fractions
   final List<Color> colors; // length 5
   final List<int> counts; // length 5
-  _FunnelPainter(
+  const _PipelineStageBars(
       {required this.levels, required this.colors, required this.counts});
 
   @override
-  void paint(Canvas canvas, Size size) {
-    final n = colors.length;
-    final maxW = size.width * 0.86;
-    final cx = size.width / 2;
-    const gap = 5.0;
-    final bandH = (size.height - 8 - gap * (n - 1)) / n;
-    const minW = 42.0;
-    double y0 = 4;
-    for (int i = 0; i < n; i++) {
-      final topFrac = levels[i];
-      final botFrac = levels[i + 1];
-      final isLast = i == n - 1;
-      final topW = math.max(minW, topFrac * maxW);
-      final botW = isLast
-          ? math.max(12.0, botFrac * maxW * 0.5)
-          : math.max(minW, botFrac * maxW);
-      final y1 = y0 + bandH;
-      final path = Path()
-        ..moveTo(cx - topW / 2, y0)
-        ..lineTo(cx + topW / 2, y0)
-        ..lineTo(cx + botW / 2, y1)
-        ..lineTo(cx - botW / 2, y1)
-        ..close();
-      canvas.drawPath(path, Paint()..color = colors[i]);
-
-      final pctLabel = (levels[i + 1] * 100).round();
-      final tp = TextPainter(
-        text: TextSpan(
-            text: 'S${i + 1}  $pctLabel%  ·  ${counts[i]}',
-            style: const TextStyle(
-                fontSize: 10.5,
-                fontWeight: FontWeight.w700,
-                color: Colors.white)),
-        textAlign: TextAlign.center,
-        textDirection: ui.TextDirection.ltr,
-      )..layout(maxWidth: math.max(topW, botW));
-      tp.paint(
-          canvas, Offset(cx - tp.width / 2, y0 + bandH / 2 - tp.height / 2));
-
-      y0 = y1 + gap;
-    }
+  Widget build(BuildContext context) {
+    return Column(
+      children: List.generate(colors.length, (i) {
+        final frac = levels[i + 1].clamp(0.0, 1.0);
+        final pct = (frac * 100).round();
+        final prevPct = (levels[i] * 100).round();
+        final dropPct = prevPct - pct;
+        return Padding(
+          padding: EdgeInsets.only(bottom: i < colors.length - 1 ? 12 : 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 22,
+                    height: 22,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                        color: colors[i].withValues(alpha: 0.15),
+                        shape: BoxShape.circle),
+                    child: Text('${i + 1}',
+                        style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                            color: colors[i])),
+                  ),
+                  const SizedBox(width: 8),
+                  Text('Stage ${i + 1}',
+                      style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: AppTheme.textSecondary)),
+                  const Spacer(),
+                  if (i > 0 && dropPct > 0)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.arrow_downward_rounded,
+                            size: 12, color: Colors.red.shade400),
+                        Text(' -$dropPct%',
+                            style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.red.shade400)),
+                      ]),
+                    ),
+                  Text('${counts[i]}  ·  $pct%',
+                      style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w800,
+                          color: colors[i])),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: LayoutBuilder(builder: (context, constraints) {
+                  return Stack(children: [
+                    Container(
+                      height: 10,
+                      width: constraints.maxWidth,
+                      color: colors[i].withValues(alpha: 0.12),
+                    ),
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 400),
+                      height: 10,
+                      width: constraints.maxWidth * frac,
+                      decoration: BoxDecoration(
+                        color: colors[i],
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                  ]);
+                }),
+              ),
+            ],
+          ),
+        );
+      }),
+    );
   }
-
-  @override
-  bool shouldRepaint(covariant _FunnelPainter old) =>
-      old.levels != levels || old.counts != counts;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2715,10 +3282,12 @@ class _PulseCompanyCard extends StatefulWidget {
 }
 
 class _PulseCompanyCardState extends State<_PulseCompanyCard> {
-  bool _expanded = false;
+  int? _expandedStage; // tapped stage tile, or null
   int _sc(int s) => widget.invoices.where((i) => i.stage == s).length;
   double get _amt => widget.invoices
       .fold(0.0, (s, i) => s + (double.tryParse(i.invoiceAmount) ?? 0));
+  double get _avg =>
+      widget.invoices.isEmpty ? 0 : _amt / widget.invoices.length;
 
   String _fmtA(double v) {
     if (v >= 10000000) return '${(v / 10000000).toStringAsFixed(1)}Cr';
@@ -2734,12 +3303,14 @@ class _PulseCompanyCardState extends State<_PulseCompanyCard> {
     final missingColor = !missingKnown
         ? AppTheme.textSecondary
         : (missing! > 0 ? AppTheme.danger : AppTheme.success);
+    final cardColor = AppStages.color(1);
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: AppTheme.divider),
+        color: const Color(0xFFFCFDFE),
+        borderRadius: BorderRadius.circular(12),
+        border: Border(top: BorderSide(color: cardColor, width: 3)),
         boxShadow: [
           BoxShadow(
               color: Colors.black.withValues(alpha: 0.04),
@@ -2748,124 +3319,139 @@ class _PulseCompanyCardState extends State<_PulseCompanyCard> {
         ],
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        InkWell(
-          onTap: () => setState(() => _expanded = !_expanded),
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(14)),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-            child:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Expanded(
-                    child: Text(widget.companyName,
-                        style: const TextStyle(
-                            fontWeight: FontWeight.w800, fontSize: 14),
-                        maxLines: 1,
-                        overflow: TextOverflow.fade)),
-                Text('${widget.invoices.length} inv  ·  ₹${_fmtA(_amt)}',
-                    style: const TextStyle(
-                        fontSize: 11, color: AppTheme.textSecondary)),
-                const SizedBox(width: 6),
+        // ── Header: dot · name · count · missing badge · value — one row ──
+        Row(children: [
+          Container(
+              width: 9,
+              height: 9,
+              margin: const EdgeInsets.only(right: 7),
+              decoration:
+                  BoxDecoration(color: cardColor, shape: BoxShape.circle)),
+          Expanded(
+              child: Text(widget.companyName,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w800, fontSize: 13),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis)),
+          const SizedBox(width: 6),
+          Text('${widget.invoices.length} inv · avg ₹${_fmtA(_avg)}',
+              style:
+                  const TextStyle(fontSize: 10, color: AppTheme.textSecondary)),
+          const SizedBox(width: 6),
+          GestureDetector(
+            onTap: widget.onTapMissing,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: !missingKnown
+                    ? AppTheme.surface
+                    : (missing! > 0
+                        ? AppTheme.danger.withValues(alpha: 0.1)
+                        : AppTheme.success.withValues(alpha: 0.1)),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
                 Icon(
-                    _expanded
-                        ? Icons.keyboard_arrow_up_rounded
-                        : Icons.keyboard_arrow_down_rounded,
-                    color: AppTheme.textSecondary,
-                    size: 20),
+                    !missingKnown
+                        ? Icons.hourglass_empty_rounded
+                        : (missing! > 0
+                            ? Icons.priority_high_rounded
+                            : Icons.check_rounded),
+                    size: 11,
+                    color: missingColor),
+                if (missingKnown && missing! > 0) ...[
+                  const SizedBox(width: 3),
+                  Text('$missing',
+                      style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w800,
+                          color: missingColor)),
+                ],
               ]),
-              const SizedBox(height: 8),
-              Row(
-                  children: List.generate(5, (i) {
-                final s = i + 1;
-                final c = _sc(s);
-                final color = AppStages.color(s);
-                return Expanded(
-                    child: Container(
-                  margin: EdgeInsets.only(right: i < 4 ? 4 : 0),
-                  padding: const EdgeInsets.symmetric(vertical: 5),
-                  decoration: BoxDecoration(
-                    color: c > 0
-                        ? color.withValues(alpha: 0.12)
-                        : AppTheme.surface,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
-                        color: c > 0
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text('₹${_fmtA(_amt)}',
+              style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w800,
+                  color: AppTheme.textPrimary)),
+        ]),
+        const SizedBox(height: 8),
+        // ── S1-S5 stage tiles — tap one to drill into its invoices ──────
+        Row(
+            children: List.generate(5, (i) {
+          final s = i + 1;
+          final c = _sc(s);
+          final color = AppStages.color(s);
+          final active = _expandedStage == s;
+          return Expanded(
+              child: GestureDetector(
+            onTap: () => setState(() => _expandedStage = active ? null : s),
+            child: Container(
+              margin: EdgeInsets.only(right: i < 4 ? 4 : 0),
+              padding: const EdgeInsets.symmetric(vertical: 5),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: active ? 0.20 : 0.12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                    color: active
+                        ? color
+                        : (c > 0
                             ? color.withValues(alpha: 0.35)
                             : AppTheme.divider),
-                  ),
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    Text('$c',
-                        style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w800,
-                            color: c > 0 ? color : AppTheme.divider)),
-                    Text('S$s',
-                        style: TextStyle(
-                            fontSize: 8,
-                            color: c > 0
-                                ? color.withValues(alpha: 0.8)
-                                : AppTheme.divider)),
-                  ]),
-                ));
-              })),
-              const SizedBox(height: 8),
-              GestureDetector(
-                onTap: widget.onTapMissing,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: !missingKnown
-                        ? AppTheme.surface
-                        : (missing! > 0
-                            ? AppTheme.danger.withValues(alpha: 0.08)
-                            : AppTheme.success.withValues(alpha: 0.08)),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                        color: !missingKnown
-                            ? AppTheme.divider
-                            : (missing! > 0
-                                ? AppTheme.danger.withValues(alpha: 0.3)
-                                : AppTheme.success.withValues(alpha: 0.3))),
-                  ),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(Icons.search_off_rounded,
-                        size: 13, color: missingColor),
-                    const SizedBox(width: 5),
-                    Text(
-                      widget.isLoadingMissing
-                          ? 'Checking missing invoices…'
-                          : missing == null
-                              ? 'No series configured'
-                              : '$missing missing invoice${missing == 1 ? '' : 's'}',
-                      style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          color: missingColor),
-                    ),
-                    if (widget.onTapMissing != null) ...[
-                      const SizedBox(width: 4),
-                      const Icon(Icons.chevron_right_rounded,
-                          size: 14, color: AppTheme.textSecondary),
-                    ],
-                  ]),
-                ),
+                    width: active ? 1.4 : 1),
               ),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Text('S$s',
+                    style: TextStyle(
+                        fontSize: 8,
+                        fontWeight: FontWeight.w800,
+                        color: c > 0
+                            ? color.withValues(alpha: 0.8)
+                            : AppTheme.divider)),
+                Text('$c',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        color: c > 0 ? color : AppTheme.divider)),
+                Text(
+                    widget.invoices.isNotEmpty
+                        ? '${(c / widget.invoices.length * 100).toStringAsFixed(0)}%'
+                        : '0%',
+                    style: TextStyle(
+                        fontSize: 7.5,
+                        color: c > 0
+                            ? color.withValues(alpha: 0.7)
+                            : AppTheme.divider)),
+              ]),
+            ),
+          ));
+        })),
+        if (_expandedStage != null) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+                color: AppTheme.surface,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: AppTheme.divider)),
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                  'S$_expandedStage · ${AppStages.label(_expandedStage!)} — ${_sc(_expandedStage!)} invoices',
+                  style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: AppStages.color(_expandedStage!))),
+              const SizedBox(height: 6),
+              ...widget.invoices.where((i) => i.stage == _expandedStage).map(
+                  (inv) => GestureDetector(
+                      onTap: () => widget.onTapInvoice(inv),
+                      child: _InvoiceRow(
+                          inv: inv, color: AppStages.color(inv.stage)))),
             ]),
           ),
-        ),
-        if (_expanded) ...[
-          const Divider(height: 1, color: AppTheme.divider),
-          Padding(
-              padding: const EdgeInsets.fromLTRB(0, 6, 0, 0),
-              child: Column(
-                  children: widget.invoices
-                      .map((inv) => GestureDetector(
-                          onTap: () => widget.onTapInvoice(inv),
-                          child: _InvoiceRow(
-                              inv: inv, color: AppStages.color(inv.stage))))
-                      .toList())),
-          const SizedBox(height: 6),
         ],
       ]),
     );

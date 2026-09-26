@@ -4,6 +4,7 @@ import 'package:form_app/app_theme.dart';
 import 'package:form_app/data.dart';
 import 'package:form_app/api_service.dart';
 import 'package:form_app/step1.dart' show OrderTypeFlag;
+import 'package:form_app/step2.dart';
 import 'package:form_app/permission_guard.dart';
 import 'package:form_app/user_permissions.dart';
 import 'package:form_app/auth_service.dart';
@@ -26,18 +27,41 @@ class _Step3State extends State<Step3> {
   final _tripNumberCtrl = TextEditingController();
   final _openingKmCtrl = TextEditingController();
   final _vehicleNumberCtrl = TextEditingController();
+  // Free text — which vehicle is actually carrying this trip's cases
+  // (a transport company's vehicle, "Direct Vehicle", "Self Vehicle", etc.).
+  // Each invoice already carries its own transport (party default, shown as
+  // the "Default Transport" chip below) — this field is NOT that; it's not
+  // tied to the transport master list at all, just prefilled from the
+  // default as a convenient starting point the user can overwrite.
   final _vehicleDetailsCtrl = TextEditingController();
   final _remarksCtrl = TextEditingController();
+  // Optional — freight/fare paid for this trip.
+  final _bhadaCtrl = TextEditingController();
 
   Set<String> selectedInvoices = {};
   List<InvoiceData> invoices = [];
   List<String> selectedInvoicesIdList = [];
   Map<int, Map<int, int>> _countMap = {};
   bool isLoading = false;
+  // Manual refresh (AppBar button) — separate from isLoading so it doesn't
+  // blank the whole screen: the dispatcher's selection and in-progress form
+  // fields stay visible and untouched while the invoice list quietly
+  // updates underneath, picking up anything another user just moved to
+  // Stage 2.
+  bool _isRefreshing = false;
   bool isSaving = false;
   Map<String, TextEditingController> ewayBillControllers = {};
   // Key to reset the Autocomplete widget (clears search box after selection)
   Key _autocompleteKey = UniqueKey();
+
+  // ── Split dispatch ───────────────────────────────────────────────────────
+  // Set via the small split icon on an invoice tile → _openSplitDialog.
+  // Keyed by a canonical "group key" (sorted invoice ids joined with '+') so
+  // a tagged pair (selectedInvoicesIdList links) shares ONE entry — same
+  // physical shipment, one case count, entered once. Value holds what the
+  // user typed in the popup: the invoice's actual total cases, and how many
+  // are going out on this trip.
+  Map<String, Map<String, int>> _splitCases = {};
 
   String? _detectedTransport;
   String? _detectedRoute;
@@ -60,7 +84,8 @@ class _Step3State extends State<Step3> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => guardScreenView(ScreenKeys.step3, label: 'Dispatch'));
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => guardScreenView(ScreenKeys.step3, label: 'Dispatch'));
     _autoFillTripNumber();
   }
 
@@ -72,6 +97,7 @@ class _Step3State extends State<Step3> {
     _vehicleNumberCtrl.dispose();
     _vehicleDetailsCtrl.dispose();
     _remarksCtrl.dispose();
+    _bhadaCtrl.dispose();
     super.dispose();
   }
 
@@ -149,6 +175,58 @@ class _Step3State extends State<Step3> {
     }
   }
 
+  // Manual refresh — pulls the latest Stage 2 invoice list (another user or
+  // device may have just moved one there) without touching anything the
+  // dispatcher already has in progress: selectedInvoices,
+  // selectedInvoicesIdList, _splitCases, ewayBillControllers, and all the
+  // trip/vehicle form fields are untouched here. Selection is kept by
+  // invoice number/id, not by object identity, so replacing `invoices`
+  // with freshly-fetched objects doesn't drop it. Unlike _fetchData, this
+  // does NOT set isLoading — the whole form stays on screen throughout
+  // instead of being replaced by a spinner.
+  Future<void> _refreshInvoices() async {
+    if (_isRefreshing || isLoading) return;
+    setState(() => _isRefreshing = true);
+    final fs = ApiService();
+    final List<InvoiceData> fetchedInvoices;
+    if (_dispatchDate != null) {
+      fetchedInvoices = await fs.getInvoicesUpToDate(_dispatchDate!);
+    } else {
+      fetchedInvoices = await fs.getInvoices(2);
+    }
+    final fetchedRoutes = await fs.getRoutes();
+    final fetchedTransports = await fs.getTransport();
+    final counts = await fs.getInvoiceCountMap(2);
+    fetchedInvoices.sort((a, b) {
+      final stopCmp = a.partyData.stopSeq.compareTo(b.partyData.stopSeq);
+      if (stopCmp != 0) return stopCmp;
+      final partyCmp = a.partyData.partyName.compareTo(b.partyData.partyName);
+      if (partyCmp != 0) return partyCmp;
+      return a.invoiceNumber.compareTo(b.invoiceNumber);
+    });
+    if (!mounted) return;
+    final oldNumbers = invoices.map((d) => d.invoiceNumber).toSet();
+    final newCount = fetchedInvoices
+        .where((d) => !oldNumbers.contains(d.invoiceNumber))
+        .length;
+    setState(() {
+      _countMap = counts;
+      invoices = fetchedInvoices;
+      _routes = fetchedRoutes;
+      _transportList = fetchedTransports.map((t) => t.trim()).toList();
+      _isRefreshing = false;
+    });
+    Get.snackbar(
+      'Refreshed',
+      newCount > 0
+          ? '$newCount new invoice${newCount == 1 ? '' : 's'} now available for selection'
+          : 'No new invoices — list is up to date',
+      backgroundColor: AppTheme.stageDispatch,
+      colorText: Colors.white,
+      duration: const Duration(seconds: 3),
+    );
+  }
+
   void _updateFormFields() {
     if (selectedInvoices.isEmpty) {
       ewayBillControllers.values.forEach((c) => c.dispose());
@@ -199,8 +277,17 @@ class _Step3State extends State<Step3> {
           _transportList.contains(_detectedTransport)) {
         _selectedTransport = _detectedTransport;
       }
-      if (_suggestedTransports.length == 1)
-        _vehicleDetailsCtrl.text = _suggestedTransports.first;
+      // Prefill the vehicle-assignment field, but only while the user hasn't
+      // typed anything of their own — prefer the invoice's own transport
+      // (each invoice carries its own), fall back to the route's single
+      // suggested transport if there's no per-invoice one.
+      if (_vehicleDetailsCtrl.text.trim().isEmpty) {
+        if (_detectedTransport != null && _detectedTransport!.isNotEmpty) {
+          _vehicleDetailsCtrl.text = _detectedTransport!;
+        } else if (_suggestedTransports.length == 1) {
+          _vehicleDetailsCtrl.text = _suggestedTransports.first;
+        }
+      }
       ewayBillControllers.keys
           .where((inv) => !selectedInvoices.contains(inv))
           .toList()
@@ -215,7 +302,247 @@ class _Step3State extends State<Step3> {
               TextEditingController(text: inv.ewayBillNumber);
         }
       }
+      // Drop a split entry once every invoice in its group is deselected.
+      _splitCases.removeWhere((key, _) {
+        final ids = key.split('+');
+        return !ids.every((id) {
+          final inv = invoices
+              .cast<InvoiceData?>()
+              .firstWhere((d) => d?.id == id, orElse: () => null);
+          return inv != null && selectedInvoices.contains(inv.invoiceNumber);
+        });
+      });
     });
+  }
+
+  // ── Tagged-group helpers for split dispatch ─────────────────────────────
+  // A tagged group is just this invoice plus whatever selectedInvoicesIdList
+  // already points at (the same links _addInvoiceFromPlanner uses to
+  // auto-select partners) — no separate adjacency map needed.
+  List<InvoiceData> _taggedGroup(InvoiceData inv) {
+    final group = <InvoiceData>[inv];
+    for (final id in inv.selectedInvoicesIdList) {
+      final linked = invoices
+          .cast<InvoiceData?>()
+          .firstWhere((d) => d?.id == id, orElse: () => null);
+      if (linked != null && !group.any((g) => g.id == linked.id)) {
+        group.add(linked);
+      }
+    }
+    return group;
+  }
+
+  String _groupKeyFor(InvoiceData inv) {
+    final ids = _taggedGroup(inv).map((d) => d.id).toList()..sort();
+    return ids.join('+');
+  }
+
+  bool _isSplitMarked(InvoiceData inv) =>
+      _splitCases.containsKey(_groupKeyFor(inv));
+
+  String? _splitLabelFor(InvoiceData inv) {
+    final entry = _splitCases[_groupKeyFor(inv)];
+    if (entry == null) return null;
+    final total = entry['total'] ?? 0;
+    final dispatched = entry['dispatched'] ?? 0;
+    return '$dispatched of $total now · ${total - dispatched} balance';
+  }
+
+  // Quick summary: total cases actually going out on this trip, across all
+  // selected invoices. A split-marked group (tagged pair or single invoice
+  // with a split entry) is counted once, using the cases entered for THIS
+  // trip — not its full invoice total, since only part of it may be going
+  // out now. Anything not split-marked counts its own full case total.
+  int get _totalCasesSelected {
+    final countedGroups = <String>{};
+    int total = 0;
+    for (final invNum in selectedInvoices) {
+      final inv = invoices
+          .cast<InvoiceData?>()
+          .firstWhere((d) => d?.invoiceNumber == invNum, orElse: () => null);
+      if (inv == null) continue;
+      final key = _groupKeyFor(inv);
+      final split = _splitCases[key];
+      if (split != null) {
+        if (countedGroups.contains(key)) continue;
+        countedGroups.add(key);
+        total += split['dispatched'] ?? 0;
+      } else {
+        total += int.tryParse(inv.totalCase ?? '') ?? 0;
+      }
+    }
+    return total;
+  }
+
+  // ── Split-dispatch popup ─────────────────────────────────────────────────
+  // Tapped from the split icon on an invoice tile, before the +/- select
+  // icon. Asks for the invoice's actual total cases and how many are going
+  // out now (tagged partners share one entry), then selects the invoice(s)
+  // so they're ready for e-way bill entry below.
+  Future<void> _openSplitDialog(InvoiceData inv) async {
+    final group = _taggedGroup(inv);
+    final key = _groupKeyFor(inv);
+    final existing = _splitCases[key];
+    // Prefill from the invoice's own totalCase when we already have one on
+    // file (set at packaging) and the user hasn't entered a split before —
+    // saves retyping a number the app already knows, still fully editable.
+    final knownTotal = int.tryParse(inv.totalCase ?? '');
+    final totalCtrl = TextEditingController(
+        text: existing != null
+            ? '${existing['total']}'
+            : (knownTotal != null && knownTotal > 0 ? '$knownTotal' : ''));
+    final dispatchedCtrl = TextEditingController(
+        text: existing != null ? '${existing['dispatched']}' : '');
+    final formKey = GlobalKey<FormState>();
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) {
+        final total = int.tryParse(totalCtrl.text.trim());
+        final dispatched = int.tryParse(dispatchedCtrl.text.trim());
+        final valid = total != null &&
+            total > 0 &&
+            dispatched != null &&
+            dispatched > 0 &&
+            dispatched <= total;
+        final balance = valid ? total! - dispatched! : null;
+        return AlertDialog(
+          title: Row(children: [
+            const Icon(Icons.call_split_rounded,
+                color: AppTheme.stagePacking, size: 20),
+            const SizedBox(width: 8),
+            const Expanded(
+                child: Text('Split Dispatch', style: TextStyle(fontSize: 16))),
+          ]),
+          content: SingleChildScrollView(
+            child: Form(
+              key: formKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    group.length > 1
+                        ? '${group.map((m) => m.invoiceNumber).join(' & ')} — tagged, one shipment'
+                        : inv.invoiceNumber,
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w700, fontSize: 13),
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: totalCtrl,
+                    keyboardType: TextInputType.number,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Actual invoice cases',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    validator: (v) {
+                      final n = int.tryParse((v ?? '').trim());
+                      if (n == null || n <= 0)
+                        return 'Enter a valid case count';
+                      return null;
+                    },
+                    onChanged: (_) => setDialogState(() {}),
+                  ),
+                  const SizedBox(height: 10),
+                  TextFormField(
+                    controller: dispatchedCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: 'Cases dispatched now',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    validator: (v) {
+                      final n = int.tryParse((v ?? '').trim());
+                      final t = int.tryParse(totalCtrl.text.trim());
+                      if (n == null || n <= 0)
+                        return 'Enter a valid case count';
+                      if (t != null && n > t) return 'Can\'t exceed total';
+                      return null;
+                    },
+                    onChanged: (_) => setDialogState(() {}),
+                  ),
+                  const SizedBox(height: 10),
+                  if (balance != null)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: balance > 0
+                            ? AppTheme.warning.withValues(alpha: 0.1)
+                            : AppTheme.success.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(children: [
+                        Icon(
+                            balance > 0
+                                ? Icons.pending_actions_rounded
+                                : Icons.check_circle_rounded,
+                            size: 16,
+                            color: balance > 0
+                                ? AppTheme.warning
+                                : AppTheme.success),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            balance > 0
+                                ? 'Balance after this trip: $balance cases stay partially dispatched'
+                                : 'Fully dispatched — nothing left after this trip',
+                            style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: balance > 0
+                                    ? AppTheme.warning
+                                    : AppTheme.success),
+                          ),
+                        ),
+                      ]),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Cancel')),
+            ElevatedButton(
+              onPressed: () {
+                if (!(formKey.currentState?.validate() ?? false)) return;
+                Navigator.of(ctx).pop(true);
+              },
+              child: const Text('Save Split'),
+            ),
+          ],
+        );
+      }),
+    );
+
+    if (saved == true) {
+      final total = int.tryParse(totalCtrl.text.trim()) ?? 0;
+      final dispatched = int.tryParse(dispatchedCtrl.text.trim()) ?? 0;
+      setState(() {
+        for (final m in group) {
+          if (!selectedInvoices.contains(m.invoiceNumber)) {
+            selectedInvoices.add(m.invoiceNumber);
+            selectedInvoicesIdList.add(m.id);
+          }
+        }
+        _updateFormFields();
+        _splitCases[key] = {'total': total, 'dispatched': dispatched};
+        _autocompleteKey = UniqueKey();
+      });
+    }
+    // No manual dispose here: showDialog's Future resolves the instant
+    // Navigator.pop() runs, but the dialog's closing transition keeps
+    // rebuilding these TextFormFields for a few more frames after that —
+    // disposing immediately raced that animation and threw "used after
+    // being disposed". These controllers are local to this function and
+    // referenced nowhere else, so they're garbage-collected normally once
+    // it returns; nothing is leaked by skipping an explicit dispose here.
   }
 
   @override
@@ -278,6 +605,7 @@ class _Step3State extends State<Step3> {
       body: Column(children: [
         // ── Date picker banner — must select before seeing invoices ───────
         _buildDateBanner(),
+        if (_dateSelected) _buildQuickActionsRow(),
         Expanded(
           child: !_dateSelected
               ? _buildDatePrompt()
@@ -387,6 +715,46 @@ class _Step3State extends State<Step3> {
           ),
         ]),
       ),
+    );
+  }
+
+  // ── Quick actions row — colorful buttons shown right below the date
+  // banner once a dispatch date is picked. Moved here (out of the AppBar,
+  // where they were plain white icons) per request, and given each their
+  // own bold stage-colored pill so they read as primary actions rather
+  // than incidental toolbar icons.
+  Widget _buildQuickActionsRow() {
+    final showUpdatePacking = AuthService.to.perms.canView(ScreenKeys.step2);
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      child: Row(children: [
+        if (showUpdatePacking) ...[
+          Expanded(
+            child: _QuickActionButton(
+              label: 'S2 Update',
+              icon: Icons.inventory_2_rounded,
+              gradientColors: const [Color(0xFFAB47BC), Color(0xFF7B1FA2)],
+              onTap: () async {
+                await Get.to(() => const Step2(returnAfterSave: true));
+                // Back from Stage 2 — pick up whatever just got packed
+                // without the dispatcher having to press Refresh.
+                if (mounted) _refreshInvoices();
+              },
+            ),
+          ),
+          const SizedBox(width: 10),
+        ],
+        Expanded(
+          child: _QuickActionButton(
+            label: _isRefreshing ? 'Refreshing…' : 'Refresh',
+            icon: Icons.refresh_rounded,
+            gradientColors: const [Color(0xFF26C6DA), Color(0xFF00838F)],
+            loading: _isRefreshing,
+            onTap: _isRefreshing ? null : _refreshInvoices,
+          ),
+        ),
+      ]),
     );
   }
 
@@ -679,6 +1047,9 @@ class _Step3State extends State<Step3> {
                     color: color,
                     onTapInvoice: (inv) => _addInvoiceFromPlanner(inv),
                     selectedInvoices: selectedInvoices,
+                    onSplitTap: (inv) => _openSplitDialog(inv),
+                    isSplitDone: (inv) => _isSplitMarked(inv),
+                    splitLabelFor: (inv) => _splitLabelFor(inv),
                   );
                 }),
                 if (availableInvoices.every((inv) {
@@ -697,6 +1068,9 @@ class _Step3State extends State<Step3> {
                         color: color,
                         onTapInvoice: (inv) => _addInvoiceFromPlanner(inv),
                         selectedInvoices: selectedInvoices,
+                        onSplitTap: (inv) => _openSplitDialog(inv),
+                        isSplitDone: (inv) => _isSplitMarked(inv),
+                        splitLabelFor: (inv) => _splitLabelFor(inv),
                       )),
               ],
             ]),
@@ -986,6 +1360,9 @@ class _Step3State extends State<Step3> {
                                   selectedInvoices.contains(inv.invoiceNumber),
                               onTap: () => _addInvoiceFromPlanner(inv),
                               indent: false,
+                              onSplitTap: () => _openSplitDialog(inv),
+                              splitDone: _isSplitMarked(inv),
+                              splitLabel: _splitLabelFor(inv),
                             )),
                       ]),
                 );
@@ -997,7 +1374,8 @@ class _Step3State extends State<Step3> {
               const SizedBox(height: 10),
               const Divider(height: 1),
               const SizedBox(height: 10),
-              Text('Selected (${selectedInvoices.length})',
+              Text(
+                  'Selected (${selectedInvoices.length}) · $_totalCasesSelected cases',
                   style: const TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
@@ -1123,22 +1501,29 @@ class _Step3State extends State<Step3> {
       icon: Icons.local_shipping_rounded,
       color: AppTheme.stageDispatch,
       children: [
-        DropdownButtonFormField<String>(
-          value: _transportList.contains(_selectedTransport)
-              ? _selectedTransport
-              : null,
+        if (selectedInvoices.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: _InfoChip(
+                icon: Icons.inventory_2_rounded,
+                label:
+                    'Total: $_totalCasesSelected cases across ${selectedInvoices.length} invoice${selectedInvoices.length == 1 ? '' : 's'}',
+                color: AppTheme.stageDispatch),
+          ),
+        // Free text, not tied to the transport master list — each invoice
+        // already carries its own transport; this is which vehicle is
+        // actually carrying THIS trip (a transport's vehicle, "Direct
+        // Vehicle", "Self Vehicle", etc.), prefilled from the invoice's
+        // default above but fully editable.
+        TextFormField(
+          controller: _vehicleDetailsCtrl,
           decoration: const InputDecoration(
-            labelText: 'Transport *',
+            labelText: 'Vehicle Assignment *',
+            hintText: 'Transport name, Direct Vehicle, or Self Vehicle',
             prefixIcon: Icon(Icons.local_shipping_rounded),
           ),
-          isExpanded: true,
-          hint: const Text('Select transport'),
-          items: _transportList
-              .map((t) => DropdownMenuItem(
-                  value: t, child: Text(t, overflow: TextOverflow.ellipsis)))
-              .toList(),
-          onChanged: (val) => setState(() => _selectedTransport = val),
-          validator: (val) => val == null ? 'Please select transport' : null,
+          validator: (val) =>
+              val == null || val.trim().isEmpty ? 'Required' : null,
         ),
         const SizedBox(height: 12),
         TextFormField(
@@ -1169,6 +1554,14 @@ class _Step3State extends State<Step3> {
         ]),
         const SizedBox(height: 12),
         TextFormField(
+          controller: _bhadaCtrl,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(
+              labelText: 'Bhada (optional)',
+              prefixIcon: Icon(Icons.currency_rupee_rounded)),
+        ),
+        const SizedBox(height: 12),
+        TextFormField(
           controller: _remarksCtrl,
           maxLines: 2,
           decoration: const InputDecoration(
@@ -1185,7 +1578,10 @@ class _Step3State extends State<Step3> {
         style: ElevatedButton.styleFrom(
             backgroundColor: AppTheme.stageDispatch,
             padding: const EdgeInsets.symmetric(vertical: 16)),
-        onPressed: (isSaving || !AuthService.to.perms.canUpdate(ScreenKeys.step3)) ? null : _submit,
+        onPressed:
+            (isSaving || !AuthService.to.perms.canUpdate(ScreenKeys.step3))
+                ? null
+                : _submit,
         icon: isSaving
             ? const SizedBox(
                 width: 18,
@@ -1213,12 +1609,21 @@ class _Step3State extends State<Step3> {
     }
 
     final data = {
+      // The new /invoices/dispatch-split endpoint takes `ids` at the top
+      // level (flat body), unlike /invoices/batch-update's {ids, data} —
+      // selectedInvoicesIdList below is kept too, for the tagged-invoice
+      // linking the server already does with it.
+      'ids': selectedInvoicesIdList,
       'tripNumber': _tripNumberCtrl.text.trim(),
       'openingKm': _openingKmCtrl.text.trim(),
-      'transportName': _selectedTransport ?? '',
+      // Free-text vehicle assignment (transport name / Direct Vehicle /
+      // Self Vehicle) — kept under the same 'transportName' key the server
+      // already expects, just no longer restricted to the master list.
+      'transportName': _vehicleDetailsCtrl.text.trim(),
       'vehicleNumber': _vehicleNumberCtrl.text.trim(),
       'routeName': _detectedRoute ?? '',
       'remarks': _remarksCtrl.text.trim(),
+      'bhada': _bhadaCtrl.text.trim(),
       'dispatchDate': _dispatchDate != null
           ? DateFormat('dd/MM/yyyy').format(_dispatchDate!)
           : '',
@@ -1227,7 +1632,26 @@ class _Step3State extends State<Step3> {
       'timestamp': DateTime.now().millisecondsSinceEpoch,
     };
 
-    final success = await ApiService().createDispatch(data);
+    // Split dispatch — only present when the split icon/popup was used for
+    // at least one invoice. Keyed by invoice id, same as ewayBillNumbers
+    // above, so a tagged pair carries the SAME total/dispatched values
+    // (counted once for the shared shipment, not per invoice). An invoice
+    // with no entry here just finalizes immediately on the server, exactly
+    // like a normal dispatch.
+    if (_splitCases.isNotEmpty) {
+      final caseTotals = <String, int>{};
+      final caseCounts = <String, int>{};
+      for (final entry in _splitCases.entries) {
+        for (final id in entry.key.split('+')) {
+          caseTotals[id] = entry.value['total'] ?? 0;
+          caseCounts[id] = entry.value['dispatched'] ?? 0;
+        }
+      }
+      data['caseTotals'] = caseTotals;
+      data['caseCounts'] = caseCounts;
+    }
+
+    final success = await ApiService().createPartialDispatch(data);
     setState(() => isSaving = false);
 
     if (success) {
@@ -1243,9 +1667,11 @@ class _Step3State extends State<Step3> {
         _vehicleDetailsCtrl.clear();
         _vehicleNumberCtrl.clear();
         _remarksCtrl.clear();
+        _bhadaCtrl.clear();
         _detectedRoute = null;
         _detectedTransport = null;
         _suggestedTransports = [];
+        _splitCases.clear();
       });
       _autoFillTripNumber();
       _fetchData();
@@ -1291,7 +1717,8 @@ class _Step3EditPageState extends State<Step3EditPage> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => guardScreenView(ScreenKeys.step3, label: 'Dispatch'));
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => guardScreenView(ScreenKeys.step3, label: 'Dispatch'));
     final first = widget.invoices.first;
     _tripNumberCtrl = TextEditingController(text: widget.tripNumber);
     _vehicleCtrl = TextEditingController(text: first.vehicleNumber ?? '');
@@ -1450,7 +1877,10 @@ class _Step3EditPageState extends State<Step3EditPage> {
         ]),
         actions: [
           TextButton.icon(
-            onPressed: (_saving || !AuthService.to.perms.canUpdate(ScreenKeys.step3)) ? null : _save,
+            onPressed:
+                (_saving || !AuthService.to.perms.canUpdate(ScreenKeys.step3))
+                    ? null
+                    : _save,
             icon: _saving
                 ? const SizedBox(
                     width: 16,
@@ -1733,7 +2163,11 @@ class _Step3EditPageState extends State<Step3EditPage> {
                                 shape: RoundedRectangleBorder(
                                     borderRadius: BorderRadius.circular(10)),
                               ),
-                              onPressed: (_saving || !AuthService.to.perms.canUpdate(ScreenKeys.step3)) ? null : _addInvoicesToTrip,
+                              onPressed: (_saving ||
+                                      !AuthService.to.perms
+                                          .canUpdate(ScreenKeys.step3))
+                                  ? null
+                                  : _addInvoicesToTrip,
                               icon: _saving
                                   ? const SizedBox(
                                       width: 16,
@@ -1857,7 +2291,10 @@ class _Step3EditPageState extends State<Step3EditPage> {
                 style: ElevatedButton.styleFrom(
                     backgroundColor: AppTheme.stageDispatch,
                     padding: const EdgeInsets.symmetric(vertical: 14)),
-                onPressed: (_saving || !AuthService.to.perms.canUpdate(ScreenKeys.step3)) ? null : _save,
+                onPressed: (_saving ||
+                        !AuthService.to.perms.canUpdate(ScreenKeys.step3))
+                    ? null
+                    : _save,
                 icon: _saving
                     ? const SizedBox(
                         width: 18,
@@ -2026,11 +2463,17 @@ class _StopGroupWidget extends StatelessWidget {
   final Color color;
   final void Function(InvoiceData) onTapInvoice;
   final Set<String> selectedInvoices;
+  final void Function(InvoiceData) onSplitTap;
+  final bool Function(InvoiceData) isSplitDone;
+  final String? Function(InvoiceData) splitLabelFor;
   const _StopGroupWidget(
       {required this.group,
       required this.color,
       required this.onTapInvoice,
-      required this.selectedInvoices});
+      required this.selectedInvoices,
+      required this.onSplitTap,
+      required this.isSplitDone,
+      required this.splitLabelFor});
 
   @override
   Widget build(BuildContext context) {
@@ -2092,6 +2535,9 @@ class _StopGroupWidget extends StatelessWidget {
                 selected: selectedInvoices.contains(inv.invoiceNumber),
                 onTap: () => onTapInvoice(inv),
                 indent: !isUnassigned,
+                onSplitTap: () => onSplitTap(inv),
+                splitDone: isSplitDone(inv),
+                splitLabel: splitLabelFor(inv),
               )),
         const Divider(height: 1, color: AppTheme.divider),
       ]),
@@ -2105,12 +2551,18 @@ class _RouteGroup extends StatelessWidget {
   final Color color;
   final void Function(InvoiceData) onTapInvoice;
   final Set<String> selectedInvoices;
+  final void Function(InvoiceData) onSplitTap;
+  final bool Function(InvoiceData) isSplitDone;
+  final String? Function(InvoiceData) splitLabelFor;
   const _RouteGroup(
       {required this.route,
       required this.invoices,
       required this.color,
       required this.onTapInvoice,
-      required this.selectedInvoices});
+      required this.selectedInvoices,
+      required this.onSplitTap,
+      required this.isSplitDone,
+      required this.splitLabelFor});
 
   @override
   Widget build(BuildContext context) {
@@ -2143,6 +2595,9 @@ class _RouteGroup extends StatelessWidget {
               selected: selectedInvoices.contains(inv.invoiceNumber),
               onTap: () => onTapInvoice(inv),
               indent: true,
+              onSplitTap: () => onSplitTap(inv),
+              splitDone: isSplitDone(inv),
+              splitLabel: splitLabelFor(inv),
             )),
         const Divider(height: 1, color: AppTheme.divider),
       ]),
@@ -2156,12 +2611,18 @@ class _PlannerInvoiceTile extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
   final bool indent;
+  final VoidCallback? onSplitTap;
+  final bool splitDone;
+  final String? splitLabel;
   const _PlannerInvoiceTile(
       {required this.inv,
       required this.color,
       required this.selected,
       required this.onTap,
-      this.indent = true});
+      this.indent = true,
+      this.onSplitTap,
+      this.splitDone = false,
+      this.splitLabel});
 
   @override
   Widget build(BuildContext context) {
@@ -2202,13 +2663,126 @@ class _PlannerInvoiceTile extends StatelessWidget {
                   Text('₹${inv.invoiceAmount}  ·  ${inv.companyName}',
                       style: const TextStyle(
                           fontSize: 10, color: AppTheme.textSecondary)),
+                  if (splitDone && splitLabel != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(splitLabel!,
+                          style: const TextStyle(
+                              fontSize: 9,
+                              fontStyle: FontStyle.italic,
+                              fontWeight: FontWeight.w700,
+                              color: AppTheme.stagePacking)),
+                    ),
                 ])),
+            if (onSplitTap != null)
+              Padding(
+                padding: const EdgeInsets.only(right: 2),
+                child: GestureDetector(
+                  onTap: onSplitTap,
+                  child: Tooltip(
+                    message: splitDone ? 'Edit split' : 'Split dispatch',
+                    child: Container(
+                      padding: const EdgeInsets.all(5),
+                      decoration: BoxDecoration(
+                        color: splitDone
+                            ? AppTheme.stagePacking.withValues(alpha: 0.15)
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(7),
+                      ),
+                      child: Icon(Icons.call_split_rounded,
+                          size: 15,
+                          color: splitDone
+                              ? AppTheme.stagePacking
+                              : AppTheme.textSecondary.withValues(alpha: 0.5)),
+                    ),
+                  ),
+                ),
+              ),
             if (selected)
               Icon(Icons.remove_circle_rounded, color: color, size: 18)
             else
               Icon(Icons.add_circle_outline_rounded,
                   color: color.withValues(alpha: 0.5), size: 18),
           ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Colorful quick-action button — used below the date banner on the
+// Dispatch screen for "Update Packing" and "Refresh". A filled gradient
+// pill rather than a plain icon button, so these read as primary actions.
+class _QuickActionButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final List<Color> gradientColors;
+  final VoidCallback? onTap;
+  final bool loading;
+
+  const _QuickActionButton({
+    required this.label,
+    required this.icon,
+    required this.gradientColors,
+    required this.onTap,
+    this.loading = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = onTap == null;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: disabled
+                  ? [Colors.grey.shade400, Colors.grey.shade500]
+                  : gradientColors,
+            ),
+            borderRadius: BorderRadius.circular(12),
+            boxShadow: [
+              BoxShadow(
+                color: (disabled ? Colors.grey : gradientColors.last)
+                    .withValues(alpha: 0.35),
+                blurRadius: 8,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (loading)
+                const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2, color: Colors.white),
+                )
+              else
+                Icon(icon, size: 17, color: Colors.white),
+              const SizedBox(width: 7),
+              Flexible(
+                child: Text(
+                  label,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
